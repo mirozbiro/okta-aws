@@ -1,0 +1,27 @@
+# okta-aws configuration file
+# Copy this file to ~/.okta-aws and fill in your values.
+#
+# All values can also be supplied via CLI flags or prompted interactively.
+
+[default]
+
+# Your Okta organization URL (required)
+okta_url = https://yourcompany.okta.com
+
+# The "Embed Link" of the AWS SAML app in Okta (required)
+# Admins can find this under Applications → <App> → General → App Embed Link
+app_url = https://yourcompany.okta.com/home/amazon_aws/0oa.../272
+
+# Your Okta username (usually your corporate email address)
+username = you@yourcompany.com
+
+# AWS credentials profile to write to (default: okta)
+# Use "default" to make these the default credentials for the AWS CLI.
+profile = okta
+
+# Default AWS region
+region = us-east-1
+
+# Optional: session duration in seconds (default comes from the SAML assertion,
+# typically 3600 s = 1 hour; max allowed by STS is 43200 s = 12 hours)
+# duration = 3600
