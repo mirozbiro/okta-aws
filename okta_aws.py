@@ -185,7 +185,7 @@ def _handle_push(okta_url, factor, state_token):
 # ---------------------------------------------------------------------------
 
 
-def get_saml_assertion(okta_url, app_url, session_token):
+def get_saml_assertion(okta_url, app_url, session_token, debug=False):
     """Retrieve the base64-encoded SAML assertion from the Okta AWS app.
 
     Two strategies are tried:
@@ -203,24 +203,47 @@ def get_saml_assertion(okta_url, app_url, session_token):
 
     # Strategy 1: session cookie exchange
     cookie_url = f"{okta_url}/login/sessionCookieRedirect"
+    if debug:
+        print(f"[DEBUG] Strategy 1: GET {cookie_url}")
+        print(f"[DEBUG]   params: checkAccountSetupComplete=true, token=<redacted>, redirectUrl={app_url}")
     resp = session.get(
         cookie_url,
         params={"checkAccountSetupComplete": "true", "token": session_token, "redirectUrl": app_url},
         allow_redirects=True,
         timeout=30,
     )
+    if debug:
+        print(f"[DEBUG] Final URL after redirects: {resp.url}")
+        print(f"[DEBUG] HTTP status: {resp.status_code}")
+        print(f"[DEBUG] Redirect chain: {[r.url for r in resp.history]}")
+        print(f"[DEBUG] Response HTML (first 3000 chars):\n{resp.text[:3000]}")
     resp.raise_for_status()
     saml_assertion, action_url = _extract_saml_form(resp.text)
 
+    if debug:
+        print(f"[DEBUG] SAMLResponse found (strategy 1): {bool(saml_assertion)}")
+        print(f"[DEBUG] Form action URL (strategy 1): {action_url}")
+
     if not saml_assertion:
         # Strategy 2: session token as query parameter
+        strategy2_url = f"{app_url}?sessionToken={session_token}"
+        if debug:
+            print(f"[DEBUG] Strategy 2: GET {app_url}?sessionToken=<redacted>")
         resp = session.get(
-            f"{app_url}?sessionToken={session_token}",
+            strategy2_url,
             allow_redirects=True,
             timeout=30,
         )
+        if debug:
+            print(f"[DEBUG] Final URL after redirects: {resp.url}")
+            print(f"[DEBUG] HTTP status: {resp.status_code}")
+            print(f"[DEBUG] Redirect chain: {[r.url for r in resp.history]}")
+            print(f"[DEBUG] Response HTML (first 3000 chars):\n{resp.text[:3000]}")
         resp.raise_for_status()
         saml_assertion, action_url = _extract_saml_form(resp.text)
+        if debug:
+            print(f"[DEBUG] SAMLResponse found (strategy 2): {bool(saml_assertion)}")
+            print(f"[DEBUG] Form action URL (strategy 2): {action_url}")
 
     if not saml_assertion:
         raise ValueError(
@@ -648,6 +671,8 @@ Examples:
                         help="Pre-select AWS account ID or name (skips account prompt)")
     parser.add_argument("--role",
                         help="Pre-select IAM role name (skips role prompt)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print verbose debug information (URLs, HTML, SAML XML)")
     return parser
 
 
@@ -734,21 +759,38 @@ def main():
     # --- SAML assertion ---
     print("Retrieving SAML assertion from AWS app…")
     try:
-        saml_assertion, action_url, http_session = get_saml_assertion(okta_url, app_url, session_token)
+        saml_assertion, action_url, http_session = get_saml_assertion(
+            okta_url, app_url, session_token, debug=args.debug
+        )
     except Exception as exc:
         print(f"Failed to retrieve SAML assertion: {exc}")
         sys.exit(1)
+
+    if args.debug:
+        print(f"[DEBUG] SAML form action URL: {action_url}")
+        try:
+            import base64 as _b64
+            saml_xml = _b64.b64decode(saml_assertion).decode("utf-8")
+            print(f"[DEBUG] Decoded SAML XML (first 3000 chars):\n{saml_xml[:3000]}")
+        except Exception as e:
+            print(f"[DEBUG] Could not decode SAML assertion: {e}")
 
     # -----------------------------------------------------------------------
     # Detect whether this is an AWS SSO (IAM Identity Center) app or a
     # classic STS/SAML app by inspecting the SAML form action URL.
     # SSO ACS URLs contain "portal.sso" or "identitycenter" / "sso.amazonaws"
     # -----------------------------------------------------------------------
-    is_sso = action_url and (
+    is_sso = bool(sso_region) or (action_url and (
         "portal.sso" in action_url
         or "identitycenter" in action_url
         or ("sso" in action_url and "amazonaws.com" in action_url)
-    )
+    ))
+
+    if args.debug:
+        print(f"[DEBUG] is_sso detection result: {is_sso}  (action_url={action_url!r})")
+        if not is_sso and action_url:
+            print("[DEBUG] action_url does not match SSO patterns — falling back to STS path.")
+            print("[DEBUG] If your setup uses SSO, run with --sso-region to force SSO mode.")
 
     if is_sso:
         # ---- AWS IAM Identity Center (SSO) path ----
