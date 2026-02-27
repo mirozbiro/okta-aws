@@ -345,13 +345,16 @@ def _parse_role_value(text):
 SSO_DEFAULT_REGION = "us-east-1"
 
 
-def submit_saml_to_sso(action_url, saml_assertion, http_session):
+def submit_saml_to_sso(action_url, saml_assertion, http_session, debug=False):
     """POST the SAML assertion to the AWS SSO ACS endpoint.
 
     Returns the x-amz-sso_authn token extracted from the response cookies,
     plus the SSO region inferred from the action_url host.
     Raises ValueError when the token cannot be found.
     """
+    if debug:
+        print(f"[DEBUG] POSTing SAMLResponse to: {action_url}")
+
     resp = http_session.post(
         action_url,
         data={"SAMLResponse": saml_assertion},
@@ -360,18 +363,61 @@ def submit_saml_to_sso(action_url, saml_assertion, http_session):
     )
     resp.raise_for_status()
 
-    # The portal sets x-amz-sso_authn as a cookie on the SSO domain
+    if debug:
+        print(f"[DEBUG] SSO POST final URL: {resp.url}")
+        print(f"[DEBUG] SSO POST status: {resp.status_code}")
+        print(f"[DEBUG] SSO POST redirect chain:")
+        for r in resp.history:
+            print(f"[DEBUG]   {r.status_code} -> {r.url}")
+            print(f"[DEBUG]   cookies set: {dict(r.cookies)}")
+        print(f"[DEBUG] Final response cookies: {dict(resp.cookies)}")
+        print(f"[DEBUG] All session cookies: {dict(http_session.cookies)}")
+        print(f"[DEBUG] Response headers: {dict(resp.headers)}")
+        print(f"[DEBUG] Response HTML (first 3000 chars):\n{resp.text[:3000]}")
+
+    # Try all places the token could appear:
+    # 1. Session jar (most common — set during redirect chain)
     token = http_session.cookies.get("x-amz-sso_authn")
+
+    # 2. Final response cookies
     if not token:
-        # Sometimes it arrives as a header or query param in the redirect
+        token = resp.cookies.get("x-amz-sso_authn")
+
+    # 3. Any hop in the redirect chain
+    if not token:
         for r in resp.history:
             token = r.cookies.get("x-amz-sso_authn")
             if token:
+                if debug:
+                    print(f"[DEBUG] Found x-amz-sso_authn in redirect hop: {r.url}")
                 break
+
+    # 4. Some versions embed the token in the HTML or a relay-state redirect URL
+    if not token:
+        import re as _re
+        # Check if it appears as a query param in the final URL
+        m = _re.search(r"[?&]x-amz-sso_authn=([^&]+)", resp.url)
+        if m:
+            token = m.group(1)
+            if debug:
+                print(f"[DEBUG] Found x-amz-sso_authn in URL query param")
+
+    # 5. Check response body for token patterns (some portal versions embed it)
+    if not token:
+        import re as _re
+        m = _re.search(r'"x-amz-sso_authn"\s*:\s*"([^"]+)"', resp.text)
+        if m:
+            token = m.group(1)
+            if debug:
+                print(f"[DEBUG] Found x-amz-sso_authn in response JSON body")
+
+    if debug:
+        print(f"[DEBUG] x-amz-sso_authn token found: {bool(token)}")
 
     if not token:
         raise ValueError(
-            "Could not retrieve x-amz-sso_authn token after SAML POST. "
+            "Could not retrieve x-amz-sso_authn token after SAML POST.\n"
+            "Run with --debug to inspect the full redirect chain and cookies.\n"
             "Verify that the Okta app is configured for AWS IAM Identity Center (SSO)."
         )
 
@@ -796,7 +842,9 @@ def main():
         # ---- AWS IAM Identity Center (SSO) path ----
         print("Detected AWS IAM Identity Center (SSO) portal. Completing SSO login…")
         try:
-            sso_token, inferred_sso_region = submit_saml_to_sso(action_url, saml_assertion, http_session)
+            sso_token, inferred_sso_region = submit_saml_to_sso(
+                action_url, saml_assertion, http_session, debug=args.debug
+            )
         except Exception as exc:
             print(f"Failed to complete SSO login: {exc}")
             sys.exit(1)
