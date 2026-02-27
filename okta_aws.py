@@ -342,12 +342,36 @@ def okta_idx_authn(okta_url, client_id, username, password, debug=False):
         idx_state = idx_resp.json()
 
     # --- Step 5: answer password challenge ---
+    # IDX uses two sub-steps:
+    #   a) challenge  → POST to idp/idx/challenge  (initiate / pick method)
+    #   b) challenge/answer → POST to idp/idx/challenge/answer  (submit passcode)
+    # Some orgs skip (a) and return challenge/answer directly.
     chal_href, _ = _idx_find_remediation(
-        idx_state, "challenge-factor", "authenticator-verification-data"
+        idx_state, "challenge", "challenge/answer", "authenticator-verification-data"
     )
     if chal_href and not inline_pw:
         if debug:
-            print(f"[IDX] POST challenge-factor (password) → {chal_href}")
+            print(f"[IDX] POST challenge (password) → {chal_href}")
+        # First POST may just initiate the challenge (no credentials yet)
+        name_found = next(
+            (r.get("name") for r in idx_state.get("remediation", {}).get("value", [])
+             if r.get("name") in ("challenge", "challenge/answer", "authenticator-verification-data")),
+            None,
+        )
+        if name_found == "challenge":
+            # Initiate challenge, then submit answer
+            idx_resp = session.post(chal_href, json={}, headers=IDX_HEADERS, timeout=30)
+            if debug:
+                print(f"[IDX] challenge initiate status: {idx_resp.status_code}")
+            idx_resp.raise_for_status()
+            idx_state = idx_resp.json()
+            # Now look for challenge/answer
+            ans_href, _ = _idx_find_remediation(
+                idx_state, "challenge/answer", "authenticator-verification-data"
+            )
+            chal_href = ans_href or chal_href  # fall back to same href if not changed
+        if debug:
+            print(f"[IDX] POST challenge/answer (password) → {chal_href}")
         idx_resp = session.post(
             chal_href,
             json={"credentials": {"passcode": password}},
@@ -355,7 +379,7 @@ def okta_idx_authn(okta_url, client_id, username, password, debug=False):
             timeout=30,
         )
         if debug:
-            print(f"[IDX] challenge-factor status: {idx_resp.status_code}")
+            print(f"[IDX] challenge/answer status: {idx_resp.status_code}")
         idx_resp.raise_for_status()
         idx_state = idx_resp.json()
 
@@ -371,6 +395,22 @@ def okta_idx_authn(okta_url, client_id, username, password, debug=False):
     return session_token, session
 
 
+def _idx_is_push(chal_form):
+    """Return True if the IDX challenge form is for Okta Verify push (not a code entry)."""
+    # IDX push authenticators have no 'credentials' value field, or have
+    # methodType=push in their currentAuthenticator context.
+    for fv in (chal_form or {}).get("value", []):
+        if fv.get("name") == "credentials":
+            return False  # a credentials field means the user must type a code
+    # Also check authenticator context if present
+    auth = (chal_form or {}).get("relatesTo", {}) or {}
+    if isinstance(auth, dict):
+        method = auth.get("value", {}).get("methodTypes", [])
+        if isinstance(method, list) and method:
+            return method[0] == "push"
+    return True  # no credentials field → treat as push / number-challenge
+
+
 def _handle_idx_mfa(idx_state, session, debug=False):
     """Consume MFA remediations in the IDX state machine.  Returns updated state."""
     enroll_href, _ = _idx_find_remediation(idx_state, "select-authenticator-enroll")
@@ -378,60 +418,106 @@ def _handle_idx_mfa(idx_state, session, debug=False):
         print("MFA enrollment is required. Please enroll a factor in Okta first.")
         sys.exit(1)
 
-    for _ in range(8):  # guard against infinite loops
-        # Is there a pending authenticator selection (non-password MFA)?
+    for _ in range(16):  # guard against infinite loops
+        # Available remediation names at each MFA step:
+        #   select-authenticator-authenticate  → choose which MFA
+        #   challenge                          → initiate challenge (e.g. send push / SMS)
+        #   challenge/answer                   → submit the code
+        #   challenge-poll                     → poll push approval
         sel_href, sel_form = _idx_find_remediation(idx_state, "select-authenticator-authenticate")
-        chal_href, chal_form = _idx_find_remediation(idx_state, "challenge-factor")
+        chal_href, chal_form = _idx_find_remediation(idx_state, "challenge", "challenge/answer")
+        poll_href, _ = _idx_find_remediation(idx_state, "challenge-poll")
+
+        if debug:
+            avail = [r.get("name") for r in idx_state.get("remediation", {}).get("value", [])]
+            print(f"[IDX] MFA loop remediations: {avail}")
+
+        if poll_href:
+            # We're inside a push poll — keep polling until approved
+            if time.time() > getattr(_handle_idx_mfa, "_deadline", time.time() + PUSH_POLL_TIMEOUT):
+                print("\nPush notification timed out.")
+                sys.exit(1)
+            print(".", end="", flush=True)
+            time.sleep(PUSH_POLL_INTERVAL)
+            idx_resp = session.post(poll_href, json={}, headers=IDX_HEADERS, timeout=30)
+            idx_resp.raise_for_status()
+            idx_state = idx_resp.json()
+            continue
 
         if not sel_href and not chal_href:
-            break  # no more MFA steps
+            break  # no more MFA steps — flow is complete
 
         if chal_href:
-            # Determine what type: look for push vs TOTP
-            factor_type = ""
-            for fv in (chal_form or {}).get("value", []):
-                if fv.get("name") == "credentials":
-                    factor_type = "totp"
+            chal_name = next(
+                (r.get("name") for r in idx_state.get("remediation", {}).get("value", [])
+                 if r.get("name") in ("challenge", "challenge/answer")),
+                "challenge",
+            )
 
-            if factor_type == "push":
-                # Okta Verify push
-                print("Sending push notification to Okta Verify… please approve it.", flush=True)
-                idx_resp = session.post(
-                    chal_href, json={}, headers=IDX_HEADERS, timeout=30
-                )
+            if chal_name == "challenge":
+                # POST to /idp/idx/challenge — initiates the challenge
+                # (sends push notification, SMS, etc.)
+                if debug:
+                    print(f"[IDX] POST challenge (initiate) → {chal_href}")
+                idx_resp = session.post(chal_href, json={}, headers=IDX_HEADERS, timeout=30)
+                if debug:
+                    print(f"[IDX] challenge initiate status: {idx_resp.status_code}")
                 idx_resp.raise_for_status()
                 idx_state = idx_resp.json()
-                # Poll
-                deadline = time.time() + PUSH_POLL_TIMEOUT
-                while True:
-                    poll_href, _ = _idx_find_remediation(idx_state, "challenge-poll")
-                    if not poll_href:
-                        break
-                    if time.time() > deadline:
-                        print("\nPush notification timed out.")
-                        sys.exit(1)
-                    print(".", end="", flush=True)
-                    time.sleep(PUSH_POLL_INTERVAL)
-                    idx_resp = session.post(poll_href, json={}, headers=IDX_HEADERS, timeout=30)
+                # Set push deadline marker so the poll branch above can use it
+                _handle_idx_mfa._deadline = time.time() + PUSH_POLL_TIMEOUT  # type: ignore[attr-defined]
+                # Check next state for push poll vs code entry
+                poll_href2, _ = _idx_find_remediation(idx_state, "challenge-poll")
+                ans_href, ans_form = _idx_find_remediation(idx_state, "challenge/answer")
+                if poll_href2:
+                    # Push was initiated — next loop iteration will poll
+                    print("Sending push notification to Okta Verify… please approve it.", flush=True)
+                elif ans_href:
+                    # Code-based MFA (TOTP / SMS / email)
+                    code = input("Enter MFA code: ").strip()
+                    if debug:
+                        print(f"[IDX] POST challenge/answer → {ans_href}")
+                    idx_resp = session.post(
+                        ans_href,
+                        json={"credentials": {"passcode": code}},
+                        headers=IDX_HEADERS,
+                        timeout=30,
+                    )
+                    if debug:
+                        print(f"[IDX] challenge/answer status: {idx_resp.status_code}")
                     idx_resp.raise_for_status()
                     idx_state = idx_resp.json()
-                print()
+                continue
+
             else:
-                # TOTP / SMS / email code
-                code = input("Enter MFA code: ").strip()
-                idx_resp = session.post(
-                    chal_href,
-                    json={"credentials": {"passcode": code}},
-                    headers=IDX_HEADERS,
-                    timeout=30,
-                )
-                if debug:
-                    print(f"[IDX] MFA challenge answer status: {idx_resp.status_code}")
-                idx_resp.raise_for_status()
-                idx_state = idx_resp.json()
+                # challenge/answer — direct code submission
+                if _idx_is_push(chal_form):
+                    # Should not normally happen (push goes via challenge → poll)
+                    # but handle gracefully by issuing the challenge first
+                    if debug:
+                        print(f"[IDX] Push detected at challenge/answer — treating as initiate")
+                    idx_resp = session.post(chal_href, json={}, headers=IDX_HEADERS, timeout=30)
+                    idx_resp.raise_for_status()
+                    idx_state = idx_resp.json()
+                    print("Sending push notification to Okta Verify… please approve it.", flush=True)
+                    _handle_idx_mfa._deadline = time.time() + PUSH_POLL_TIMEOUT  # type: ignore[attr-defined]
+                else:
+                    code = input("Enter MFA code: ").strip()
+                    if debug:
+                        print(f"[IDX] POST challenge/answer → {chal_href}")
+                    idx_resp = session.post(
+                        chal_href,
+                        json={"credentials": {"passcode": code}},
+                        headers=IDX_HEADERS,
+                        timeout=30,
+                    )
+                    if debug:
+                        print(f"[IDX] challenge/answer status: {idx_resp.status_code}")
+                    idx_resp.raise_for_status()
+                    idx_state = idx_resp.json()
 
         elif sel_href:
-            # Need to select a non-password MFA factor
+            # Need to select a non-password MFA authenticator
             options = []
             for fv in (sel_form or {}).get("value", []):
                 for opt in fv.get("options", []):
@@ -447,9 +533,9 @@ def _handle_idx_mfa(idx_state, session, debug=False):
                     print(f"  [{i + 1}] {opt.get('label', 'unknown')}")
                 while True:
                     try:
-                        idx = int(input("Select MFA: ").strip()) - 1
-                        if 0 <= idx < len(options):
-                            chosen = options[idx]
+                        pick = int(input("Select MFA: ").strip()) - 1
+                        if 0 <= pick < len(options):
+                            chosen = options[pick]
                             break
                     except ValueError:
                         pass
@@ -463,10 +549,13 @@ def _handle_idx_mfa(idx_state, session, debug=False):
                 timeout=30,
             )
             if debug:
-                print(f"[IDX] MFA authenticator select status: {idx_resp.status_code}")
+                print(f"[IDX] select-authenticator status: {idx_resp.status_code}")
             idx_resp.raise_for_status()
             idx_state = idx_resp.json()
 
+    # Print newline if we were dot-printing push poll
+    print("\n", end="", flush=True) if getattr(_handle_idx_mfa, "_deadline", None) else None
+    _handle_idx_mfa._deadline = None  # type: ignore[attr-defined]
     return idx_state
 
 
