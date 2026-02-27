@@ -79,7 +79,7 @@ def _print_box_close(inner):
     :func:`_draw_bar_line` (i.e. no trailing newline on that line).
     Emits a newline to leave the bar, then prints the bottom border.
     """
-    print(f"\n└{'─' * (inner + 2)}┘\n")
+    print(f"\n└{'─' * (inner + 2)}┘\n\n")
 
 
 def _draw_bar_line(inner, remaining, total):
