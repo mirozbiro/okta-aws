@@ -74,7 +74,10 @@ def _print_box_open(title, lines):
 
 def _print_box_close(inner):
     """Print the bottom border that closes a box opened with :func:`_print_box_open`."""
-    print(f"\n└{'─' * (inner + 2)}┘\n")
+    # \r clears back to column 0; the spaces wipe any leftover bar characters;
+    # the second \r moves back to column 0 before printing the border cleanly.
+    blank = " " * (inner + 6)
+    print(f"\r{blank}\r└{'─' * (inner + 2)}┘\n")
 
 
 def _draw_bar_line(inner, remaining, total):
