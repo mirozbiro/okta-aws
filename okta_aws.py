@@ -44,6 +44,30 @@ IDX_HEADERS = {
 }
 
 # ---------------------------------------------------------------------------
+# Terminal UI helpers
+# ---------------------------------------------------------------------------
+
+def _print_box(title, lines):
+    """Print a properly-aligned Unicode box with a title and body lines."""
+    max_line = max((len(l) for l in lines), default=0)
+    inner = max(len(title) + 2, max_line + 2)
+    print(f"\n┌─ {title} {'─' * (inner - len(title) - 1)}┐")
+    for line in lines:
+        print(f"│  {line}{' ' * (inner - len(line) - 2)}  │")
+    print(f"└{'─' * (inner + 2)}┘\n")
+
+
+def _step(msg):
+    """Print an in-progress step line."""
+    print(f"  →  {msg}")
+
+
+def _ok(msg):
+    """Print a completion indicator."""
+    print(f"  ✔  {msg}")
+
+
+# ---------------------------------------------------------------------------
 # PKCE + IDX helpers
 # ---------------------------------------------------------------------------
 
@@ -145,23 +169,23 @@ def _choose_factor(factors):
         "email": "Email",
     }
 
-    print("\nAvailable MFA factors:")
+    print("\n  Available MFA factors:\n")
     for i, factor in enumerate(factors):
         factor_type = factor.get("factorType", "unknown")
         provider = factor.get("provider", "")
         label = labels.get(factor_type, factor_type)
         if provider:
             label = f"{label} ({provider})"
-        print(f"  [{i + 1}] {label}")
+        print(f"  [{i + 1:>2}]  {label}")
 
     while True:
         try:
-            choice = int(input("\nSelect MFA factor: ").strip()) - 1
+            choice = int(input("\n  Select factor: ").strip()) - 1
             if 0 <= choice < len(factors):
                 return factors[choice]
         except ValueError:
             pass
-        print("Invalid selection, please try again.")
+        print("  Invalid selection — enter a number from the list.")
 
 
 def handle_mfa(okta_url, authn_result):
@@ -974,16 +998,19 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
 
         except sso_oidc.exceptions.AuthorizationPendingException:
             if not prompted:
-                print()
-                print("  ┌─ AWS SSO authorization required ────────────────────────────────┐")
-                print(f" │  Open this URL in your browser (Ctrl+click works in VS Code):  │")
-                print(f" │                                                                  │")
-                print(f" │  {verify_url}")
-                print(f" │                                                                  │")
-                print(f" │  User code: {user_code:<10}  (pre-filled in the URL above)    │")
-                print( " │  Click  Allow  in the portal, then return here.                 │")
-                print( "  └──────────────────────────────────────────────────────────────────┘")
-                print(f"\nWaiting for approval", end="", flush=True)
+                _print_box(
+                    "AWS SSO authorization required",
+                    [
+                        "Open this URL in your browser  (Ctrl+click works in VS Code):",
+                        "",
+                        verify_url,
+                        "",
+                        f"User code: {user_code}  (pre-filled in the URL above)",
+                        "",
+                        "Click  Allow  in the portal, then return here.",
+                    ],
+                )
+                print("Waiting for approval", end="", flush=True)
                 prompted = True
             else:
                 print(".", end="", flush=True)
@@ -1112,37 +1139,38 @@ def select_sso_account_and_role(entries, preselect_account=None, preselect_role=
     if len(account_ids) == 1:
         chosen_account = account_ids[0]
     else:
-        print("\nAvailable AWS accounts (SSO):")
+        max_name = max(len(groups[aid][0]["account_name"]) for aid in account_ids)
+        print("\n  Available AWS accounts:\n")
         for i, acct_id in enumerate(account_ids):
             acct_name = groups[acct_id][0]["account_name"]
             count = len(groups[acct_id])
-            print(f"  [{i + 1}] {acct_id}  {acct_name}  ({count} role{'s' if count != 1 else ''})")
+            print(f"  [{i + 1:>2}]  {acct_id}  {acct_name:<{max_name}}  ({count} role{'s' if count != 1 else ''})")
         while True:
             try:
-                idx = int(input("\nSelect account: ").strip()) - 1
+                idx = int(input("\n  Account: ").strip()) - 1
                 if 0 <= idx < len(account_ids):
                     chosen_account = account_ids[idx]
                     break
             except ValueError:
                 pass
-            print("Invalid selection, please try again.")
+            print("  Invalid selection — enter a number from the list.")
 
     account_entries = groups[chosen_account]
     if len(account_entries) == 1:
         return account_entries[0]
 
-    print(f"\nAvailable roles for {account_entries[0]['account_name']} ({chosen_account}):")
+    print(f"\n  Available roles for {account_entries[0]['account_name']} ({chosen_account}):\n")
     for i, e in enumerate(account_entries):
-        print(f"  [{i + 1}] {e['role_name']}")
+        print(f"  [{i + 1:>2}]  {e['role_name']}")
 
     while True:
         try:
-            idx = int(input("\nSelect role: ").strip()) - 1
+            idx = int(input("\n  Role: ").strip()) - 1
             if 0 <= idx < len(account_entries):
                 return account_entries[idx]
         except ValueError:
             pass
-        print("Invalid selection, please try again.")
+        print("  Invalid selection — enter a number from the list.")
 
 
 # ---------------------------------------------------------------------------
@@ -1398,7 +1426,7 @@ def main():
         except RuntimeError as exc:
             print(f"IDX authentication failed: {exc}")
             sys.exit(1)
-        print("Okta authentication successful (IDX).")
+        _ok("Okta authentication successful.")
     else:
         # ---- Classic /api/v1/authn path ----
         if args.debug:
@@ -1441,10 +1469,10 @@ def main():
             print("Okta did not return a session token. Check your credentials and try again.")
             sys.exit(1)
 
-        print("Okta authentication successful.")
+        _ok("Okta authentication successful.")
 
     # --- SAML assertion ---
-    print("Retrieving SAML assertion from AWS app…")
+    _step("Retrieving SAML assertion from AWS app…")
     try:
         saml_assertion, action_url, http_session = get_saml_assertion(
             okta_url, app_url,
@@ -1484,43 +1512,41 @@ def main():
 
     if is_sso:
         # ---- AWS IAM Identity Center (SSO) path ----
-        print("Detected AWS IAM Identity Center (SSO) portal. Completing SSO login…")
+        _step("Completing AWS SSO login…")
         try:
             portal_origin, inferred_sso_region, sso_http_session = submit_saml_to_sso(
                 action_url, saml_assertion, http_session, debug=args.debug
             )
         except Exception as exc:
-            print(f"Failed to complete SSO login: {exc}")
+            print(f"\n  ✖  SSO login failed: {exc}")
             sys.exit(1)
 
         # User-specified or config sso_region takes priority over inferred
         effective_sso_region = sso_region or inferred_sso_region
-        print(f"SSO region: {effective_sso_region}")
-
-        print("Requesting SSO access token via device authorization…")
+        _step(f"Requesting device authorization token  [{effective_sso_region}]")
         try:
             sso_access_token = get_sso_access_token_via_device_auth(
                 portal_origin, effective_sso_region, sso_http_session, debug=args.debug
             )
         except Exception as exc:
-            print(f"Failed to obtain SSO access token: {exc}")
+            print(f"\n  ✖  Failed to obtain SSO access token: {exc}")
             sys.exit(1)
 
-        print("Listing SSO accounts and roles…")
+        _step("Loading accounts and roles…")
         try:
             entries = list_sso_accounts_and_roles(
                 sso_access_token, effective_sso_region, debug=args.debug
             )
         except Exception as exc:
-            print(f"Failed to list SSO accounts/roles: {exc}")
+            print(f"\n  ✖  Failed to list SSO accounts/roles: {exc}")
             sys.exit(1)
 
         if not entries:
-            print("No SSO accounts or roles found. Check your IAM Identity Center assignments.")
+            print("\n  ✖  No accounts or roles found. Check your IAM Identity Center assignments.")
             sys.exit(1)
 
         selected = select_sso_account_and_role(entries, args.account, args.role)
-        print(f"\nRequesting credentials for: [{selected['account_name']}] {selected['account_id']} / {selected['role_name']}")
+        _step(f"Assuming  {selected['account_name']} ({selected['account_id']}) / {selected['role_name']}")
 
         try:
             credentials = get_sso_role_credentials(
@@ -1529,7 +1555,7 @@ def main():
                 debug=args.debug,
             )
         except Exception as exc:
-            print(f"Failed to get SSO role credentials: {exc}")
+            print(f"\n  ✖  Failed to get SSO role credentials: {exc}")
             sys.exit(1)
 
     else:
@@ -1551,7 +1577,7 @@ def main():
             duration = saml_duration
 
         selected_role = select_account_and_role(roles, args.account, args.role)
-        print(f"\nAssuming role: {selected_role['role_arn']}")
+        _step(f"Assuming  {selected_role['role_arn']}")
 
         try:
             credentials = assume_role_with_saml(selected_role, saml_assertion, duration, region)
@@ -1563,14 +1589,18 @@ def main():
     write_aws_credentials(credentials, profile, region)
 
     expiry = credentials["Expiration"].strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"\nCredentials written to profile '{profile}' ({AWS_CREDENTIALS_PATH})")
-    print(f"Expires: {expiry}")
+    rule = "─" * 68
+    print(f"\n{rule}")
+    _ok(f"Credentials written  →  profile '{profile}'")
+    print(f"     Expires:  {expiry}")
+    print(f"     Path:     {AWS_CREDENTIALS_PATH}")
     print()
     if profile == "default":
-        print("  aws s3 ls")
+        print("     aws s3 ls")
     else:
-        print(f"  aws --profile {profile} s3 ls")
-        print(f"  # or: export AWS_PROFILE={profile}")
+        print(f"     aws --profile {profile} s3 ls")
+        print(f"     export AWS_PROFILE={profile}")
+    print(f"{rule}\n")
 
 
 if __name__ == "__main__":
