@@ -96,7 +96,7 @@ def _draw_bar_line(inner, remaining, total, first=False):
     bar = "\u2588" * filled + "\u2591" * empty
     content = bar + time_str
     line = f"\u2502  {content:<{content_width}}  \u2502"
-    bottom = f"\u2514{'\u2500' * (inner + 2)}\u2518"
+    bottom = f"└{'─' * (inner + 2)}┘"
     if first:
         print(line)
         print(bottom)
