@@ -945,26 +945,18 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
         print(f"[DEBUG]   verifyUrl: {verify_url}")
         print(f"[DEBUG]   interval:  {interval}s  expiresIn: {expires_in}s")
 
-    # --- Attempt headless auto-approval ---
-    # The activation URL is a portal SPA at d-XXXX.awsapps.com/activate.
-    # If our http_session has a valid portal session the portal may auto-approve
-    # after GETting the URL.  This succeeds on some configurations; if not,
-    # we fall through to the manual-approval prompt below.
-    try:
-        if debug:
-            print(f"[DEBUG] Attempting headless auto-approval: GET {verify_url}")
-        act_resp = http_session.get(verify_url, allow_redirects=True, timeout=30)
-        if debug:
-            print(f"[DEBUG] Activation GET status:     {act_resp.status_code}")
-            print(f"[DEBUG] Activation GET final URL:  {act_resp.url}")
-            print(f"[DEBUG] Activation response (first 500 chars):\n{act_resp.text[:500]}")
-    except Exception as exc:
-        if debug:
-            print(f"[DEBUG] Headless activation GET failed: {exc}")
+    # --- Poll create_token, prompting the user to approve in their local browser ---
+    # The verification URL is an AWS portal SPA (awsapps.com).  Approval requires
+    # a browser session already authenticated to that portal — it cannot be
+    # completed headlessly from Python.
+    #
+    # In the VS Code integrated terminal the URL below is rendered as a clickable
+    # link that opens in your LOCAL browser (not the server's), even on a remote
+    # SSH / VS Code Server session.  If you are already logged into the AWS portal
+    # in that browser, a single "Allow" click completes the flow.
 
-    # --- Poll create_token ---
     deadline = time.time() + expires_in
-    printed_prompt = False
+    prompted = False
 
     while time.time() < deadline:
         try:
@@ -974,19 +966,25 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
                 grantType="urn:ietf:params:oauth:grant-type:device_code",
                 deviceCode=device_code,
             )
-            if printed_prompt:
-                print()  # newline after the dot-animation
+            if prompted:
+                print()  # newline after dot-animation
             if debug:
                 print("[DEBUG] SSO OIDC access token obtained successfully.")
             return token_resp["accessToken"]
 
         except sso_oidc.exceptions.AuthorizationPendingException:
-            if not printed_prompt:
-                print(f"\nTo authorize, open this URL in your browser and click Allow:")
-                print(f"  {verify_url}")
-                print(f"User code: {user_code}")
+            if not prompted:
+                print()
+                print("  ┌─ AWS SSO authorization required ────────────────────────────────┐")
+                print(f" │  Open this URL in your browser (Ctrl+click works in VS Code):  │")
+                print(f" │                                                                  │")
+                print(f" │  {verify_url}")
+                print(f" │                                                                  │")
+                print(f" │  User code: {user_code:<10}  (pre-filled in the URL above)    │")
+                print( " │  Click  Allow  in the portal, then return here.                 │")
+                print( "  └──────────────────────────────────────────────────────────────────┘")
                 print(f"\nWaiting for approval", end="", flush=True)
-                printed_prompt = True
+                prompted = True
             else:
                 print(".", end="", flush=True)
             time.sleep(interval)
