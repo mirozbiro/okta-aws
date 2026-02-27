@@ -345,10 +345,20 @@ def _parse_role_value(text):
 SSO_DEFAULT_REGION = "us-east-1"
 
 
+def _get_cookie_value(jar, name):
+    """Safely get a cookie value from a jar, handling duplicate-name cookies."""
+    # Iterate directly to avoid CookieConflictError when the same name
+    # appears on multiple domains (e.g. platform-ubid on signin.aws vs awsapps.com)
+    for cookie in jar:
+        if cookie.name == name:
+            return cookie.value
+    return None
+
+
 def submit_saml_to_sso(action_url, saml_assertion, http_session, debug=False):
     """POST the SAML assertion to the AWS SSO ACS endpoint.
 
-    Returns the x-amz-sso_authn token extracted from the response cookies,
+    Returns the sso_authn token extracted from the response cookies,
     plus the SSO region inferred from the action_url host.
     Raises ValueError when the token cannot be found.
     """
@@ -369,75 +379,104 @@ def submit_saml_to_sso(action_url, saml_assertion, http_session, debug=False):
         print(f"[DEBUG] SSO POST redirect chain:")
         for r in resp.history:
             print(f"[DEBUG]   {r.status_code} -> {r.url}")
-            print(f"[DEBUG]   cookies set: {dict(r.cookies)}")
-        print(f"[DEBUG] Final response cookies: {dict(resp.cookies)}")
-        print(f"[DEBUG] All session cookies: {dict(http_session.cookies)}")
+            try:
+                print(f"[DEBUG]   cookies set: {dict(r.cookies)}")
+            except Exception:
+                print(f"[DEBUG]   cookies set: (could not display — duplicate names)")
+        try:
+            print(f"[DEBUG] Final response cookies: {dict(resp.cookies)}")
+        except Exception:
+            print(f"[DEBUG] Final response cookies: (could not display — duplicate names)")
+        try:
+            print(f"[DEBUG] All session cookies: {dict(http_session.cookies)}")
+        except Exception:
+            pass
         print(f"[DEBUG] Response headers: {dict(resp.headers)}")
         print(f"[DEBUG] Response HTML (first 3000 chars):\n{resp.text[:3000]}")
 
-    # Try all places the token could appear:
-    # 1. Session jar — search all cookies regardless of domain scope
+    # AWS IAM Identity Center has had TWO different cookie names across portal versions:
+    #   - Old portal (pre-2023):  x-amz-sso_authn
+    #   - New Access Portal:      aws-usi-authn
+    # We check all possible names, and search all jars safely.
+    TOKEN_COOKIE_NAMES = ("aws-usi-authn", "x-amz-sso_authn")
     token = None
-    for cookie in http_session.cookies:
-        if cookie.name == "x-amz-sso_authn":
-            token = cookie.value
+    token_name_found = None
+
+    # 1. Session jar (most common — set during redirect chain)
+    for name in TOKEN_COOKIE_NAMES:
+        token = _get_cookie_value(http_session.cookies, name)
+        if token:
+            token_name_found = name
             if debug:
-                print(f"[DEBUG] Found x-amz-sso_authn in session jar (domain={cookie.domain})")
+                print(f"[DEBUG] Found '{name}' in session jar")
             break
 
     # 2. Final response cookies
     if not token:
-        for cookie in resp.cookies:
-            if cookie.name == "x-amz-sso_authn":
-                token = cookie.value
+        for name in TOKEN_COOKIE_NAMES:
+            token = _get_cookie_value(resp.cookies, name)
+            if token:
+                token_name_found = name
                 if debug:
-                    print(f"[DEBUG] Found x-amz-sso_authn in final response cookies (domain={cookie.domain})")
+                    print(f"[DEBUG] Found '{name}' in final response cookies")
                 break
 
     # 3. Any hop in the redirect chain
     if not token:
         for r in resp.history:
-            for cookie in r.cookies:
-                if cookie.name == "x-amz-sso_authn":
-                    token = cookie.value
+            for name in TOKEN_COOKIE_NAMES:
+                token = _get_cookie_value(r.cookies, name)
+                if token:
+                    token_name_found = name
                     if debug:
-                        print(f"[DEBUG] Found x-amz-sso_authn in redirect hop cookies: {r.url} (domain={cookie.domain})")
+                        print(f"[DEBUG] Found '{name}' in redirect hop: {r.url}")
                     break
             if token:
                 break
 
-    # 4. Check if it appears as a query param in the final URL
+    # 4. Check query params in the final URL
     if not token:
         import re as _re
-        m = _re.search(r"[?&]x-amz-sso_authn=([^&]+)", resp.url)
-        if m:
-            token = m.group(1)
-            if debug:
-                print(f"[DEBUG] Found x-amz-sso_authn in URL query param")
+        for name in TOKEN_COOKIE_NAMES:
+            m = _re.search(rf"[?&]{_re.escape(name)}=([^&]+)", resp.url)
+            if m:
+                token = m.group(1)
+                token_name_found = name
+                if debug:
+                    print(f"[DEBUG] Found '{name}' in final URL query params")
+                break
 
-    # 5. Check response body for token patterns (some portal versions embed it)
+    # 5. Check response body JSON
     if not token:
         import re as _re
-        m = _re.search(r'"x-amz-sso_authn"\s*:\s*"([^"]+)"', resp.text)
-        if m:
-            token = m.group(1)
-            if debug:
-                print(f"[DEBUG] Found x-amz-sso_authn in response JSON body")
+        for name in TOKEN_COOKIE_NAMES:
+            m = _re.search(rf'"{_re.escape(name)}"\s*:\s*"([^"]+)"', resp.text)
+            if m:
+                token = m.group(1)
+                token_name_found = name
+                if debug:
+                    print(f"[DEBUG] Found '{name}' in response body JSON")
+                break
 
     if debug:
-        print(f"[DEBUG] x-amz-sso_authn token found: {bool(token)}")
+        print(f"[DEBUG] Auth token found: {bool(token)} (cookie name: {token_name_found!r})")
 
     if not token:
         raise ValueError(
-            "Could not retrieve x-amz-sso_authn token after SAML POST.\n"
+            "Could not retrieve SSO auth token (aws-usi-authn / x-amz-sso_authn) after SAML POST.\n"
             "Run with --debug to inspect the full redirect chain and cookies.\n"
             "Verify that the Okta app is configured for AWS IAM Identity Center (SSO)."
         )
 
-    # Derive region from hostname: portal.sso.<region>.amazonaws.com or similar
+    # Infer region from the action_url:
+    #   New portal:  eu-west-1.signin.aws.amazon.com/platform/saml/acs/...
+    #   Old portal:  portal.sso.eu-west-1.amazonaws.com/...
     import re
-    m = re.search(r"portal\.sso\.([a-z0-9-]+)\.amazonaws\.com", action_url)
+    m = re.search(r"([a-z]{2}-[a-z]+-\d)\.(?:signin\.aws|portal\.sso)", action_url)
     sso_region = m.group(1) if m else SSO_DEFAULT_REGION
+
+    if debug:
+        print(f"[DEBUG] Inferred SSO region from action_url: {sso_region}")
 
     return token, sso_region
 
