@@ -886,206 +886,177 @@ def submit_saml_to_sso(action_url, saml_assertion, http_session, debug=False):
 
     # Extract the portal origin from the final redirect URL.
     # e.g. https://d-936777ef92.awsapps.com/start/?workflowResultHandle=UUID
-    from urllib.parse import urlparse, urlunparse, urlencode, parse_qs, urljoin
+    from urllib.parse import urlparse
     parsed = urlparse(resp.url)
     portal_origin = f"{parsed.scheme}://{parsed.netloc}"
 
     if debug:
         print(f"[DEBUG] Portal origin (awsapps.com): {portal_origin}")
 
-    # -----------------------------------------------------------------------
-    # Exchange step: the portal JS calls signin.aws/auth/exchange with the
-    # workflowResultHandle to upgrade the aws-usi-authn session cookie into
-    # an x-amz-sso_authn cookie scoped to portal.sso.REGION.amazonaws.com.
-    # We must replicate this before calling any portal API.
-    # -----------------------------------------------------------------------
-    qs = parse_qs(parsed.query)
-    workflow_handle = qs.get("workflowResultHandle", [None])[0]
-    signin_base = f"https://{sso_region}.signin.aws"
-
-    if workflow_handle:
-        exchange_url = f"{signin_base}/auth/exchange"
-        # Referer must include the workflowResultHandle — AWS validates it strictly
-        referer = f"{portal_origin}/start/?workflowResultHandle={workflow_handle}"
-        if debug:
-            print(f"[DEBUG] Exchanging workflowResultHandle at: {exchange_url}")
-            print(f"[DEBUG] Exchange Origin:  {portal_origin}")
-            print(f"[DEBUG] Exchange Referer: {referer}")
-        # Must be POST (not GET), no body, query param only, same session (carries cookie)
-        exch_resp = http_session.post(
-            exchange_url,
-            params={"workflowResultHandle": workflow_handle},
-            headers={
-                "Origin": portal_origin,
-                "Referer": referer,
-                "Accept": "application/json, text/plain, */*",
-                "Content-Type": "application/json",
-            },
-            allow_redirects=True,
-            timeout=30,
-        )
-        if debug:
-            print(f"[DEBUG] Exchange status: {exch_resp.status_code}")
-            print(f"[DEBUG] Exchange final URL: {exch_resp.url}")
-            print(f"[DEBUG] Exchange redirect chain: {[r.url for r in exch_resp.history]}")
-            try:
-                print(f"[DEBUG] Exchange response: {exch_resp.text[:500]}")
-            except Exception:
-                pass
-            print(f"[DEBUG] Session cookies after exchange:")
-            for c in http_session.cookies:
-                print(f"[DEBUG]   {c.name} @ {c.domain}")
-        # Don't raise on non-200 — some orgs return a redirect to start page
-        # The important thing is that cookies are now set on portal domain.
-    else:
-        if debug:
-            print("[DEBUG] No workflowResultHandle found in redirect URL — skipping exchange")
-
-    # After the exchange, look for the portal session token (may now be
-    # x-amz-sso_authn on portal.sso.REGION.amazonaws.com)
-    portal_domain = f"portal.sso.{sso_region}.amazonaws.com"
-    portal_token = None
-    for c in http_session.cookies:
-        if c.name in ("x-amz-sso_authn", "aws-usi-authn") and portal_domain in c.domain:
-            portal_token = c.value
-            if debug:
-                print(f"[DEBUG] Found portal-scoped token after exchange: {c.name} @ {c.domain}")
-            break
-
-    # If no portal-scoped token yet, fall back to registering the usi-authn
-    # cookie directly on the portal domain (some setups don't need the exchange)
-    if not portal_token:
-        import urllib.parse as _up
-        from requests.cookies import create_cookie
-        decoded_token = _up.unquote(token)
-        for cookie_name in ("aws-usi-authn", "x-amz-sso_authn"):
-            http_session.cookies.set_cookie(
-                create_cookie(cookie_name, decoded_token,
-                              domain=portal_domain, path="/")
-            )
-        portal_token = decoded_token
-        if debug:
-            print(f"[DEBUG] No exchange token found; registered raw token on {portal_domain}")
-    else:
-        import urllib.parse as _up
-        portal_token = _up.unquote(portal_token)
-
-    return portal_token, sso_region, portal_origin, http_session
+    return portal_origin, sso_region, http_session
 
 
-def list_sso_accounts_and_roles(sso_token, sso_region, portal_origin, http_session, debug=False):
-    """Return a flat list of dicts with keys: account_id, account_name, role_name.
+def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session, debug=False):
+    """Get an AWS SSO OIDC access token using the device authorization grant flow.
 
-    Uses the Access Portal REST API (portal.sso.REGION.amazonaws.com) with the
-    aws-usi-authn portal session token via bearer header and cookie.
+    Steps:
+      1. Register an OIDC public client with AWS SSO OIDC.
+      2. Start device authorization — gets a verificationUriComplete URL and deviceCode.
+      3. Attempt headless auto-approval by GETting the activation URL with the
+         already-authenticated http_session (carries aws-usi-authn cookie).
+      4. Poll create_token until approved.  If approval is still pending after
+         the headless attempt, print the URL so the user can approve manually
+         in their browser (same experience as ``aws sso login``).
+
+    Returns the OIDC ``accessToken`` string (a JWT), valid for ~8 hours.
     """
-    import urllib.parse
-    decoded_token = urllib.parse.unquote(sso_token)
-
-    portal_base = f"https://portal.sso.{sso_region}.amazonaws.com"
-    headers = {
-        "x-amz-sso-bearer-token": decoded_token,
-        "Accept": "application/json",
-        "Origin": portal_origin,
-        "Referer": f"{portal_origin}/start/",
-    }
+    start_url = f"{portal_origin}/start/"
+    sso_oidc = boto3.client("sso-oidc", region_name=sso_region)
 
     if debug:
-        print(f"[DEBUG] Calling portal REST API: {portal_base}/assignment/accounts")
-        print(f"[DEBUG] Origin: {portal_origin}")
+        print(f"[DEBUG] Registering SSO OIDC client for {start_url}")
 
-    # List accounts
-    accounts = []
-    next_token = None
-    while True:
-        params = {"max_result": "100"}
-        if next_token:
-            params["next_token"] = next_token
-        resp = http_session.get(
-            f"{portal_base}/assignment/accounts",
-            headers=headers,
-            params=params,
-            timeout=30,
-        )
+    # Register a public OIDC client (cached ~90 days by AWS, re-registering is fine)
+    client_resp = sso_oidc.register_client(
+        clientName="okta-aws",
+        clientType="public",
+    )
+    client_id = client_resp["clientId"]
+    client_secret = client_resp["clientSecret"]
+
+    if debug:
+        print(f"[DEBUG] OIDC client registered (clientId prefix: {client_id[:12]}…)")
+
+    # Start device authorization
+    authz_resp = sso_oidc.start_device_authorization(
+        clientId=client_id,
+        clientSecret=client_secret,
+        startUrl=start_url,
+    )
+    verify_url = authz_resp["verificationUriComplete"]
+    device_code = authz_resp["deviceCode"]
+    user_code = authz_resp["userCode"]
+    interval = authz_resp.get("interval", 5)
+    expires_in = authz_resp.get("expiresIn", 600)
+
+    if debug:
+        print(f"[DEBUG] Device authorization started:")
+        print(f"[DEBUG]   userCode:  {user_code}")
+        print(f"[DEBUG]   verifyUrl: {verify_url}")
+        print(f"[DEBUG]   interval:  {interval}s  expiresIn: {expires_in}s")
+
+    # --- Attempt headless auto-approval ---
+    # The activation URL is a portal SPA at d-XXXX.awsapps.com/activate.
+    # If our http_session has a valid portal session the portal may auto-approve
+    # after GETting the URL.  This succeeds on some configurations; if not,
+    # we fall through to the manual-approval prompt below.
+    try:
         if debug:
-            print(f"[DEBUG] list accounts status: {resp.status_code}")
-            print(f"[DEBUG] list accounts response: {resp.text[:1000]}")
-        resp.raise_for_status()
-        data = resp.json()
-        accounts.extend(data.get("accountList", []))
-        next_token = data.get("nextToken")
-        if not next_token:
-            break
+            print(f"[DEBUG] Attempting headless auto-approval: GET {verify_url}")
+        act_resp = http_session.get(verify_url, allow_redirects=True, timeout=30)
+        if debug:
+            print(f"[DEBUG] Activation GET status:     {act_resp.status_code}")
+            print(f"[DEBUG] Activation GET final URL:  {act_resp.url}")
+            print(f"[DEBUG] Activation response (first 500 chars):\n{act_resp.text[:500]}")
+    except Exception as exc:
+        if debug:
+            print(f"[DEBUG] Headless activation GET failed: {exc}")
 
-    entries = []
-    for acct in accounts:
-        acct_id = acct["accountId"]
-        acct_name = acct.get("accountName", acct_id)
-        role_next = None
-        while True:
-            params = {"max_result": "100"}
-            if role_next:
-                params["next_token"] = role_next
-            resp = http_session.get(
-                f"{portal_base}/assignment/accounts/{acct_id}/roles",
-                headers=headers,
-                params=params,
-                timeout=30,
+    # --- Poll create_token ---
+    deadline = time.time() + expires_in
+    printed_prompt = False
+
+    while time.time() < deadline:
+        try:
+            token_resp = sso_oidc.create_token(
+                clientId=client_id,
+                clientSecret=client_secret,
+                grantType="urn:ietf:params:oauth:grant-type:device_code",
+                deviceCode=device_code,
             )
+            if printed_prompt:
+                print()  # newline after the dot-animation
             if debug:
-                print(f"[DEBUG] list roles for {acct_id} status: {resp.status_code}")
-            resp.raise_for_status()
-            data = resp.json()
-            for role in data.get("roleList", []):
-                entries.append({
-                    "account_id": acct_id,
-                    "account_name": acct_name,
-                    "role_name": role["roleName"],
-                })
-            role_next = data.get("nextToken")
-            if not role_next:
-                break
+                print("[DEBUG] SSO OIDC access token obtained successfully.")
+            return token_resp["accessToken"]
+
+        except sso_oidc.exceptions.AuthorizationPendingException:
+            if not printed_prompt:
+                print(f"\nTo authorize, open this URL in your browser and click Allow:")
+                print(f"  {verify_url}")
+                print(f"User code: {user_code}")
+                print(f"\nWaiting for approval", end="", flush=True)
+                printed_prompt = True
+            else:
+                print(".", end="", flush=True)
+            time.sleep(interval)
+
+        except sso_oidc.exceptions.SlowDownException:
+            interval = min(interval + 5, 30)
+            time.sleep(interval)
+
+        except Exception as exc:
+            if debug:
+                print(f"\n[DEBUG] create_token error: {type(exc).__name__}: {exc}")
+            time.sleep(interval)
+
+    raise RuntimeError(
+        f"Device authorization not approved within {expires_in} seconds. "
+        "Re-run the script and approve the URL shown above."
+    )
+
+
+def list_sso_accounts_and_roles(access_token, sso_region, debug=False):
+    """Return a flat list of dicts with keys: account_id, account_name, role_name.
+
+    Uses the boto3 ``sso`` client with the OIDC ``access_token`` obtained from
+    :func:`get_sso_access_token_via_device_auth`.  This is the same mechanism
+    used by the AWS CLI ``aws sso login`` flow.
+    """
+    sso = boto3.client("sso", region_name=sso_region)
+    entries = []
+
+    if debug:
+        print(f"[DEBUG] boto3 sso.list_accounts (region={sso_region})")
+
+    paginator = sso.get_paginator("list_accounts")
+    for page in paginator.paginate(accessToken=access_token):
+        for acct in page.get("accountList", []):
+            acct_id = acct["accountId"]
+            acct_name = acct.get("accountName", acct_id)
+            if debug:
+                print(f"[DEBUG]   account: {acct_id}  ({acct_name})")
+            role_paginator = sso.get_paginator("list_account_roles")
+            for role_page in role_paginator.paginate(accountId=acct_id, accessToken=access_token):
+                for role in role_page.get("roleList", []):
+                    entries.append({
+                        "account_id": acct_id,
+                        "account_name": acct_name,
+                        "role_name": role["roleName"],
+                    })
 
     return entries
 
 
-def get_sso_role_credentials(sso_token, sso_region, account_id, role_name,
-                              portal_origin=None, http_session=None, debug=False):
-    """Get temporary credentials via the Access Portal REST API.
+def get_sso_role_credentials(access_token, sso_region, account_id, role_name, debug=False):
+    """Get temporary credentials via the boto3 ``sso`` client.
 
-    Calls portal.sso.REGION.amazonaws.com/federation/credentials.
+    Uses the OIDC ``access_token`` from :func:`get_sso_access_token_via_device_auth`.
+    Returns a dict with keys matching the STS Credentials format:
+    ``AccessKeyId``, ``SecretAccessKey``, ``SessionToken``, ``Expiration``.
     """
-    import urllib.parse
-    decoded_token = urllib.parse.unquote(sso_token)
-
-    portal_base = f"https://portal.sso.{sso_region}.amazonaws.com"
-    headers = {
-        "x-amz-sso-bearer-token": decoded_token,
-        "Accept": "application/json",
-    }
-    if portal_origin:
-        headers["Origin"] = portal_origin
-        headers["Referer"] = f"{portal_origin}/start/"
-
-    params = {"account_id": account_id, "role_name": role_name}
-
-    if debug:
-        print(f"[DEBUG] Calling: {portal_base}/federation/credentials")
-
-    requester = http_session if http_session else requests
-    resp = requester.get(
-        f"{portal_base}/federation/credentials",
-        headers=headers,
-        params=params,
-        timeout=30,
-    )
-    if debug:
-        print(f"[DEBUG] federation/credentials status: {resp.status_code}")
-        print(f"[DEBUG] federation/credentials response: {resp.text[:500]}")
-    resp.raise_for_status()
-
-    rc = resp.json()["roleCredentials"]
     import datetime
+    sso = boto3.client("sso", region_name=sso_region)
+
+    if debug:
+        print(f"[DEBUG] boto3 sso.get_role_credentials: account={account_id} role={role_name}")
+
+    resp = sso.get_role_credentials(
+        accountId=account_id,
+        roleName=role_name,
+        accessToken=access_token,
+    )
+    rc = resp["roleCredentials"]
     return {
         "AccessKeyId": rc["accessKeyId"],
         "SecretAccessKey": rc["secretAccessKey"],
@@ -1504,7 +1475,7 @@ def main():
         # ---- AWS IAM Identity Center (SSO) path ----
         print("Detected AWS IAM Identity Center (SSO) portal. Completing SSO login…")
         try:
-            sso_token, inferred_sso_region, portal_origin, sso_http_session = submit_saml_to_sso(
+            portal_origin, inferred_sso_region, sso_http_session = submit_saml_to_sso(
                 action_url, saml_assertion, http_session, debug=args.debug
             )
         except Exception as exc:
@@ -1515,11 +1486,19 @@ def main():
         effective_sso_region = sso_region or inferred_sso_region
         print(f"SSO region: {effective_sso_region}")
 
+        print("Requesting SSO access token via device authorization…")
+        try:
+            sso_access_token = get_sso_access_token_via_device_auth(
+                portal_origin, effective_sso_region, sso_http_session, debug=args.debug
+            )
+        except Exception as exc:
+            print(f"Failed to obtain SSO access token: {exc}")
+            sys.exit(1)
+
         print("Listing SSO accounts and roles…")
         try:
             entries = list_sso_accounts_and_roles(
-                sso_token, effective_sso_region, portal_origin, sso_http_session,
-                debug=args.debug
+                sso_access_token, effective_sso_region, debug=args.debug
             )
         except Exception as exc:
             print(f"Failed to list SSO accounts/roles: {exc}")
@@ -1534,10 +1513,8 @@ def main():
 
         try:
             credentials = get_sso_role_credentials(
-                sso_token, effective_sso_region,
+                sso_access_token, effective_sso_region,
                 selected["account_id"], selected["role_name"],
-                portal_origin=portal_origin,
-                http_session=sso_http_session,
                 debug=args.debug,
             )
         except Exception as exc:
