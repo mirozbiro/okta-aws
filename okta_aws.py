@@ -376,26 +376,39 @@ def submit_saml_to_sso(action_url, saml_assertion, http_session, debug=False):
         print(f"[DEBUG] Response HTML (first 3000 chars):\n{resp.text[:3000]}")
 
     # Try all places the token could appear:
-    # 1. Session jar (most common — set during redirect chain)
-    token = http_session.cookies.get("x-amz-sso_authn")
+    # 1. Session jar — search all cookies regardless of domain scope
+    token = None
+    for cookie in http_session.cookies:
+        if cookie.name == "x-amz-sso_authn":
+            token = cookie.value
+            if debug:
+                print(f"[DEBUG] Found x-amz-sso_authn in session jar (domain={cookie.domain})")
+            break
 
     # 2. Final response cookies
     if not token:
-        token = resp.cookies.get("x-amz-sso_authn")
+        for cookie in resp.cookies:
+            if cookie.name == "x-amz-sso_authn":
+                token = cookie.value
+                if debug:
+                    print(f"[DEBUG] Found x-amz-sso_authn in final response cookies (domain={cookie.domain})")
+                break
 
     # 3. Any hop in the redirect chain
     if not token:
         for r in resp.history:
-            token = r.cookies.get("x-amz-sso_authn")
+            for cookie in r.cookies:
+                if cookie.name == "x-amz-sso_authn":
+                    token = cookie.value
+                    if debug:
+                        print(f"[DEBUG] Found x-amz-sso_authn in redirect hop cookies: {r.url} (domain={cookie.domain})")
+                    break
             if token:
-                if debug:
-                    print(f"[DEBUG] Found x-amz-sso_authn in redirect hop: {r.url}")
                 break
 
-    # 4. Some versions embed the token in the HTML or a relay-state redirect URL
+    # 4. Check if it appears as a query param in the final URL
     if not token:
         import re as _re
-        # Check if it appears as a query param in the final URL
         m = _re.search(r"[?&]x-amz-sso_authn=([^&]+)", resp.url)
         if m:
             token = m.group(1)
