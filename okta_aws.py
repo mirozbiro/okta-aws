@@ -479,33 +479,86 @@ def submit_saml_to_sso(action_url, saml_assertion, http_session, debug=False):
         print(f"[DEBUG] Inferred SSO region from action_url: {sso_region}")
 
     # Extract the portal origin from the final redirect URL.
-    # e.g. https://d-936777ef92.awsapps.com/start/?workflowResultHandle=...
-    # -> https://d-936777ef92.awsapps.com
-    from urllib.parse import urlparse
+    # e.g. https://d-936777ef92.awsapps.com/start/?workflowResultHandle=UUID
+    from urllib.parse import urlparse, urlunparse, urlencode, parse_qs, urljoin
     parsed = urlparse(resp.url)
     portal_origin = f"{parsed.scheme}://{parsed.netloc}"
 
     if debug:
         print(f"[DEBUG] Portal origin (awsapps.com): {portal_origin}")
 
-    # The auth cookie is domain-scoped to eu-west-1.signin.aws but needs to reach
-    # portal.sso.REGION.amazonaws.com.  Register it explicitly on the portal domain
-    # so requests will include it automatically when calling that host.
+    # -----------------------------------------------------------------------
+    # Exchange step: the portal JS calls signin.aws/auth/exchange with the
+    # workflowResultHandle to upgrade the aws-usi-authn session cookie into
+    # an x-amz-sso_authn cookie scoped to portal.sso.REGION.amazonaws.com.
+    # We must replicate this before calling any portal API.
+    # -----------------------------------------------------------------------
+    qs = parse_qs(parsed.query)
+    workflow_handle = qs.get("workflowResultHandle", [None])[0]
+    signin_base = f"https://{sso_region}.signin.aws"
+
+    if workflow_handle:
+        exchange_url = f"{signin_base}/auth/exchange"
+        if debug:
+            print(f"[DEBUG] Exchanging workflowResultHandle at: {exchange_url}")
+        exch_resp = http_session.get(
+            exchange_url,
+            params={"workflowResultHandle": workflow_handle},
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Referer": resp.url,
+                "Origin": portal_origin,
+            },
+            allow_redirects=True,
+            timeout=30,
+        )
+        if debug:
+            print(f"[DEBUG] Exchange status: {exch_resp.status_code}")
+            print(f"[DEBUG] Exchange final URL: {exch_resp.url}")
+            print(f"[DEBUG] Exchange redirect chain: {[r.url for r in exch_resp.history]}")
+            try:
+                print(f"[DEBUG] Exchange response: {exch_resp.text[:500]}")
+            except Exception:
+                pass
+            print(f"[DEBUG] Session cookies after exchange:")
+            for c in http_session.cookies:
+                print(f"[DEBUG]   {c.name} @ {c.domain}")
+        # Don't raise on non-200 — some orgs return a redirect to start page
+        # The important thing is that cookies are now set on portal domain.
+    else:
+        if debug:
+            print("[DEBUG] No workflowResultHandle found in redirect URL — skipping exchange")
+
+    # After the exchange, look for the portal session token (may now be
+    # x-amz-sso_authn on portal.sso.REGION.amazonaws.com)
     portal_domain = f"portal.sso.{sso_region}.amazonaws.com"
-    import urllib.parse as _up
-    decoded_token = _up.unquote(token)
-    from requests.cookies import create_cookie
-    for cookie_name in (token_name_found, "aws-usi-authn", "x-amz-sso_authn"):
-        if cookie_name:
+    portal_token = None
+    for c in http_session.cookies:
+        if c.name in ("x-amz-sso_authn", "aws-usi-authn") and portal_domain in c.domain:
+            portal_token = c.value
+            if debug:
+                print(f"[DEBUG] Found portal-scoped token after exchange: {c.name} @ {c.domain}")
+            break
+
+    # If no portal-scoped token yet, fall back to registering the usi-authn
+    # cookie directly on the portal domain (some setups don't need the exchange)
+    if not portal_token:
+        import urllib.parse as _up
+        from requests.cookies import create_cookie
+        decoded_token = _up.unquote(token)
+        for cookie_name in ("aws-usi-authn", "x-amz-sso_authn"):
             http_session.cookies.set_cookie(
                 create_cookie(cookie_name, decoded_token,
                               domain=portal_domain, path="/")
             )
+        portal_token = decoded_token
+        if debug:
+            print(f"[DEBUG] No exchange token found; registered raw token on {portal_domain}")
+    else:
+        import urllib.parse as _up
+        portal_token = _up.unquote(portal_token)
 
-    if debug:
-        print(f"[DEBUG] Registered auth cookie on portal domain: {portal_domain}")
-
-    return token, sso_region, portal_origin, http_session
+    return portal_token, sso_region, portal_origin, http_session
 
 
 def list_sso_accounts_and_roles(sso_token, sso_region, portal_origin, http_session, debug=False):
