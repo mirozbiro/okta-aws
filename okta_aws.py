@@ -193,7 +193,10 @@ def get_saml_assertion(okta_url, app_url, session_token):
        then follow redirects to the app.
     2. Append the session token directly to the app URL as a query parameter.
 
-    Returns the raw base64 SAML assertion string.
+    Returns (saml_assertion, action_url, http_session).
+      - saml_assertion: raw base64 SAML assertion string
+      - action_url: the form POST target URL (AWS SSO ACS or signin.aws.amazon.com/saml)
+      - http_session: the requests.Session with any established cookies
     Raises ValueError when no SAMLResponse form field is found.
     """
     session = requests.Session()
@@ -207,7 +210,7 @@ def get_saml_assertion(okta_url, app_url, session_token):
         timeout=30,
     )
     resp.raise_for_status()
-    saml_assertion = _extract_saml_response(resp.text)
+    saml_assertion, action_url = _extract_saml_form(resp.text)
 
     if not saml_assertion:
         # Strategy 2: session token as query parameter
@@ -217,7 +220,7 @@ def get_saml_assertion(okta_url, app_url, session_token):
             timeout=30,
         )
         resp.raise_for_status()
-        saml_assertion = _extract_saml_response(resp.text)
+        saml_assertion, action_url = _extract_saml_form(resp.text)
 
     if not saml_assertion:
         raise ValueError(
@@ -225,14 +228,24 @@ def get_saml_assertion(okta_url, app_url, session_token):
             "Verify that 'app_url' is the embed link for the AWS SAML app."
         )
 
-    return saml_assertion
+    return saml_assertion, action_url, session
+
+
+def _extract_saml_form(html):
+    """Return (saml_assertion, action_url) from an HTML form, or (None, None)."""
+    soup = BeautifulSoup(html, "lxml")
+    tag = soup.find("input", {"name": "SAMLResponse"})
+    if not tag:
+        return None, None
+    form = tag.find_parent("form")
+    action_url = form["action"] if form and form.get("action") else None
+    return tag["value"], action_url
 
 
 def _extract_saml_response(html):
     """Return the SAMLResponse value from an HTML form, or None."""
-    soup = BeautifulSoup(html, "lxml")
-    tag = soup.find("input", {"name": "SAMLResponse"})
-    return tag["value"] if tag else None
+    value, _ = _extract_saml_form(html)
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +316,167 @@ def _parse_role_value(text):
 
 
 # ---------------------------------------------------------------------------
-# Account / role selection
+# AWS IAM Identity Center (SSO) flow
+# ---------------------------------------------------------------------------
+
+SSO_DEFAULT_REGION = "us-east-1"
+
+
+def submit_saml_to_sso(action_url, saml_assertion, http_session):
+    """POST the SAML assertion to the AWS SSO ACS endpoint.
+
+    Returns the x-amz-sso_authn token extracted from the response cookies,
+    plus the SSO region inferred from the action_url host.
+    Raises ValueError when the token cannot be found.
+    """
+    resp = http_session.post(
+        action_url,
+        data={"SAMLResponse": saml_assertion},
+        allow_redirects=True,
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    # The portal sets x-amz-sso_authn as a cookie on the SSO domain
+    token = http_session.cookies.get("x-amz-sso_authn")
+    if not token:
+        # Sometimes it arrives as a header or query param in the redirect
+        for r in resp.history:
+            token = r.cookies.get("x-amz-sso_authn")
+            if token:
+                break
+
+    if not token:
+        raise ValueError(
+            "Could not retrieve x-amz-sso_authn token after SAML POST. "
+            "Verify that the Okta app is configured for AWS IAM Identity Center (SSO)."
+        )
+
+    # Derive region from hostname: portal.sso.<region>.amazonaws.com or similar
+    import re
+    m = re.search(r"portal\.sso\.([a-z0-9-]+)\.amazonaws\.com", action_url)
+    sso_region = m.group(1) if m else SSO_DEFAULT_REGION
+
+    return token, sso_region
+
+
+def list_sso_accounts_and_roles(sso_token, sso_region):
+    """Return a flat list of dicts with keys: account_id, account_name, role_name.
+
+    Uses boto3 SSO client with the short-lived portal token — no credentials needed.
+    """
+    client = boto3.client("sso", region_name=sso_region)
+    accounts = []
+    paginator = client.get_paginator("list_accounts")
+    for page in paginator.paginate(accessToken=sso_token):
+        accounts.extend(page["accountList"])
+
+    entries = []
+    for acct in accounts:
+        role_paginator = client.get_paginator("list_account_roles")
+        for page in role_paginator.paginate(
+            accessToken=sso_token, accountId=acct["accountId"]
+        ):
+            for role in page["roleList"]:
+                entries.append(
+                    {
+                        "account_id": acct["accountId"],
+                        "account_name": acct.get("accountName", acct["accountId"]),
+                        "role_name": role["roleName"],
+                    }
+                )
+    return entries
+
+
+def select_sso_account_and_role(entries, preselect_account=None, preselect_role=None):
+    """Interactive (or automatic) account and role selection for SSO entries.
+
+    Each entry has keys: account_id, account_name, role_name.
+    Returns a single selected entry dict.
+    """
+    if preselect_account or preselect_role:
+        candidates = [
+            e for e in entries
+            if (not preselect_account or e["account_id"] == preselect_account
+                or e["account_name"] == preselect_account)
+            and (not preselect_role or e["role_name"] == preselect_role)
+        ]
+        if not candidates:
+            print(
+                f"No SSO role found matching "
+                f"account={preselect_account or 'any'}, "
+                f"role={preselect_role or 'any'}"
+            )
+            print("Available entries:")
+            for e in entries:
+                print(f"  {e['account_id']} ({e['account_name']}): {e['role_name']}")
+            sys.exit(1)
+        if len(candidates) == 1:
+            return candidates[0]
+        entries = candidates
+
+    # Group by account
+    groups = {}
+    for e in entries:
+        groups.setdefault(e["account_id"], []).append(e)
+    account_ids = list(groups.keys())
+
+    if len(account_ids) == 1:
+        chosen_account = account_ids[0]
+    else:
+        print("\nAvailable AWS accounts (SSO):")
+        for i, acct_id in enumerate(account_ids):
+            acct_name = groups[acct_id][0]["account_name"]
+            count = len(groups[acct_id])
+            print(f"  [{i + 1}] {acct_id}  {acct_name}  ({count} role{'s' if count != 1 else ''})")
+        while True:
+            try:
+                idx = int(input("\nSelect account: ").strip()) - 1
+                if 0 <= idx < len(account_ids):
+                    chosen_account = account_ids[idx]
+                    break
+            except ValueError:
+                pass
+            print("Invalid selection, please try again.")
+
+    account_entries = groups[chosen_account]
+    if len(account_entries) == 1:
+        return account_entries[0]
+
+    print(f"\nAvailable roles for {account_entries[0]['account_name']} ({chosen_account}):")
+    for i, e in enumerate(account_entries):
+        print(f"  [{i + 1}] {e['role_name']}")
+
+    while True:
+        try:
+            idx = int(input("\nSelect role: ").strip()) - 1
+            if 0 <= idx < len(account_entries):
+                return account_entries[idx]
+        except ValueError:
+            pass
+        print("Invalid selection, please try again.")
+
+
+def get_sso_role_credentials(sso_token, sso_region, account_id, role_name):
+    """Call sso:GetRoleCredentials and return a Credentials-style dict."""
+    client = boto3.client("sso", region_name=sso_region)
+    resp = client.get_role_credentials(
+        roleName=role_name,
+        accountId=account_id,
+        accessToken=sso_token,
+    )
+    rc = resp["roleCredentials"]
+    import datetime
+    return {
+        "AccessKeyId": rc["accessKeyId"],
+        "SecretAccessKey": rc["secretAccessKey"],
+        "SessionToken": rc["sessionToken"],
+        "Expiration": datetime.datetime.utcfromtimestamp(rc["expiration"] / 1000),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Account / role selection  (legacy SAML/STS path — kept for fallback)
 # ---------------------------------------------------------------------------
 
 
@@ -466,11 +639,13 @@ Examples:
                         help="Okta organization URL, e.g. https://corp.okta.com")
     parser.add_argument("--app-url",
                         help="Okta AWS app embed link URL")
-    parser.add_argument("--region", help="AWS region (default: us-east-1)")
+    parser.add_argument("--region", help="AWS region written to ~/.aws/credentials (default: us-east-1)")
+    parser.add_argument("--sso-region",
+                        help="AWS SSO / IAM Identity Center region (default: us-east-1)")
     parser.add_argument("--duration", type=int,
                         help="Session duration in seconds (default: from SAML / 3600)")
     parser.add_argument("--account",
-                        help="Pre-select AWS account ID (skips account prompt)")
+                        help="Pre-select AWS account ID or name (skips account prompt)")
     parser.add_argument("--role",
                         help="Pre-select IAM role name (skips role prompt)")
     return parser
@@ -495,6 +670,7 @@ def main():
     username = cf("username", args.username)
     profile = cf("profile", args.profile, DEFAULT_PROFILE)
     region = cf("region", args.region, "us-east-1")
+    sso_region = cf("sso_region", args.sso_region, None)  # will be inferred from ACS url if not set
     duration_cfg = cf("duration", str(args.duration) if args.duration else None,
                       str(DEFAULT_SESSION_DURATION))
     duration = int(duration_cfg)
@@ -558,39 +734,84 @@ def main():
     # --- SAML assertion ---
     print("Retrieving SAML assertion from AWS app…")
     try:
-        saml_assertion = get_saml_assertion(okta_url, app_url, session_token)
+        saml_assertion, action_url, http_session = get_saml_assertion(okta_url, app_url, session_token)
     except Exception as exc:
         print(f"Failed to retrieve SAML assertion: {exc}")
         sys.exit(1)
 
-    # --- Parse roles ---
-    try:
-        roles, saml_duration = parse_saml_roles(saml_assertion)
-    except Exception as exc:
-        print(f"Failed to parse SAML assertion: {exc}")
-        sys.exit(1)
+    # -----------------------------------------------------------------------
+    # Detect whether this is an AWS SSO (IAM Identity Center) app or a
+    # classic STS/SAML app by inspecting the SAML form action URL.
+    # SSO ACS URLs contain "portal.sso" or "identitycenter" / "sso.amazonaws"
+    # -----------------------------------------------------------------------
+    is_sso = action_url and (
+        "portal.sso" in action_url
+        or "identitycenter" in action_url
+        or ("sso" in action_url and "amazonaws.com" in action_url)
+    )
 
-    if not roles:
-        print(
-            "No AWS roles found in SAML assertion. "
-            "Ensure the Okta app is configured to include Role attributes."
-        )
-        sys.exit(1)
+    if is_sso:
+        # ---- AWS IAM Identity Center (SSO) path ----
+        print("Detected AWS IAM Identity Center (SSO) portal. Completing SSO login…")
+        try:
+            sso_token, inferred_sso_region = submit_saml_to_sso(action_url, saml_assertion, http_session)
+        except Exception as exc:
+            print(f"Failed to complete SSO login: {exc}")
+            sys.exit(1)
 
-    # Use SAML-specified duration unless the user explicitly overrode it
-    if args.duration is None:
-        duration = saml_duration
+        # User-specified or config sso_region takes priority over inferred
+        effective_sso_region = sso_region or inferred_sso_region
+        print(f"SSO region: {effective_sso_region}")
 
-    # --- Select account / role ---
-    selected_role = select_account_and_role(roles, args.account, args.role)
-    print(f"\nAssuming role: {selected_role['role_arn']}")
+        print("Listing SSO accounts and roles…")
+        try:
+            entries = list_sso_accounts_and_roles(sso_token, effective_sso_region)
+        except Exception as exc:
+            print(f"Failed to list SSO accounts/roles: {exc}")
+            sys.exit(1)
 
-    # --- Assume role via STS ---
-    try:
-        credentials = assume_role_with_saml(selected_role, saml_assertion, duration, region)
-    except Exception as exc:
-        print(f"Failed to assume role: {exc}")
-        sys.exit(1)
+        if not entries:
+            print("No SSO accounts or roles found. Check your IAM Identity Center assignments.")
+            sys.exit(1)
+
+        selected = select_sso_account_and_role(entries, args.account, args.role)
+        print(f"\nRequesting credentials for: [{selected['account_name']}] {selected['account_id']} / {selected['role_name']}")
+
+        try:
+            credentials = get_sso_role_credentials(
+                sso_token, effective_sso_region,
+                selected["account_id"], selected["role_name"]
+            )
+        except Exception as exc:
+            print(f"Failed to get SSO role credentials: {exc}")
+            sys.exit(1)
+
+    else:
+        # ---- Classic STS AssumeRoleWithSAML path ----
+        try:
+            roles, saml_duration = parse_saml_roles(saml_assertion)
+        except Exception as exc:
+            print(f"Failed to parse SAML assertion: {exc}")
+            sys.exit(1)
+
+        if not roles:
+            print(
+                "No AWS roles found in SAML assertion. "
+                "Ensure the Okta app is configured to include Role attributes."
+            )
+            sys.exit(1)
+
+        if args.duration is None:
+            duration = saml_duration
+
+        selected_role = select_account_and_role(roles, args.account, args.role)
+        print(f"\nAssuming role: {selected_role['role_arn']}")
+
+        try:
+            credentials = assume_role_with_saml(selected_role, saml_assertion, duration, region)
+        except Exception as exc:
+            print(f"Failed to assume role: {exc}")
+            sys.exit(1)
 
     # --- Write credentials ---
     write_aws_credentials(credentials, profile, region)
