@@ -189,7 +189,7 @@ def get_saml_assertion(okta_url, app_url, session_token):
     """Retrieve the base64-encoded SAML assertion from the Okta AWS app.
 
     Two strategies are tried:
-    1. Exchange the session token for a cookie via /login/sessionCookies,
+    1. Exchange the session token for a cookie via /login/sessionCookieRedirect,
        then follow redirects to the app.
     2. Append the session token directly to the app URL as a query parameter.
 
@@ -199,10 +199,10 @@ def get_saml_assertion(okta_url, app_url, session_token):
     session = requests.Session()
 
     # Strategy 1: session cookie exchange
-    cookie_url = f"{okta_url}/login/sessionCookies"
+    cookie_url = f"{okta_url}/login/sessionCookieRedirect"
     resp = session.get(
         cookie_url,
-        params={"token": session_token, "redirectUrl": app_url},
+        params={"checkAccountSetupComplete": "true", "token": session_token, "redirectUrl": app_url},
         allow_redirects=True,
         timeout=30,
     )
