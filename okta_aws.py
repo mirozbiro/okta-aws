@@ -75,28 +75,34 @@ def _print_box_open(title, lines):
 def _print_box_close(inner):
     """Print the bottom border that closes a box opened with :func:`_print_box_open`.
 
-    Assumes the cursor is sitting at the end of a bar line printed with
-    :func:`_draw_bar_line` (i.e. no trailing newline on that line).
-    Emits a newline to leave the bar, then prints the bottom border.
+    The last :func:`_draw_bar_line` call already emitted a newline, so the
+    cursor is on a fresh line ready for the border.
     """
-    print(f"\n└{'─' * (inner + 2)}┘\n\n")
+    print(f"└{'─' * (inner + 2)}┘\n")
 
 
-def _draw_bar_line(inner, remaining, total):
-    """Overwrite the current terminal line with a depleting progress bar.
+def _draw_bar_line(inner, remaining, total, first=False):
+    """Print (or redraw) a depleting progress bar inside an open box.
 
-    Renders as:  │  ████████████░░░░░  8m 32s remaining  │
-    Uses \\r so the line is rewritten in place on every tick.
+    On the first call (*first=True*) it simply prints the bar with a trailing
+    newline so the terminal scrolls normally.  On subsequent calls it emits
+    ANSI cursor-up (``\\033[1A``) before rewriting, so the net terminal scroll
+    per tick is zero and the bar updates in-place without drifting to the
+    bottom of the window.
     """
     time_str = f"  {remaining // 60}m {remaining % 60:02d}s remaining"
-    # Content area = inner - 2  (inner already excludes the side spaces in _print_box_open)
     content_width = inner - 2
     bar_width = max(1, content_width - len(time_str))
     filled = int(bar_width * remaining / max(total, 1))
     empty = bar_width - filled
-    bar = "█" * filled + "░" * empty
+    bar = "\u2588" * filled + "\u2591" * empty
     content = bar + time_str
-    print(f"\r│  {content:<{content_width}}  │", end="", flush=True)
+    line = f"\u2502  {content:<{content_width}}  \u2502"
+    if first:
+        print(line)
+    else:
+        # Cursor up one line, carriage return, overwrite, then newline
+        print(f"\033[1A\r{line}")
 
 
 def _step(msg):
@@ -1067,6 +1073,7 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
 
     deadline = time.time() + expires_in
     prompted = False
+    first_bar = True
     expires_min = expires_in // 60
     box_inner = 0  # set once the box is opened
 
@@ -1100,8 +1107,10 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
                     ],
                 )
                 prompted = True
+                first_bar = True
             remaining = max(0, int(deadline - time.time()))
-            _draw_bar_line(box_inner, remaining, expires_in)
+            _draw_bar_line(box_inner, remaining, expires_in, first=first_bar)
+            first_bar = False
             time.sleep(interval)
 
         except sso_oidc.exceptions.SlowDownException:
