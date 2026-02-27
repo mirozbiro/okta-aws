@@ -905,15 +905,21 @@ def submit_saml_to_sso(action_url, saml_assertion, http_session, debug=False):
 
     if workflow_handle:
         exchange_url = f"{signin_base}/auth/exchange"
+        # Referer must include the workflowResultHandle — AWS validates it strictly
+        referer = f"{portal_origin}/start/?workflowResultHandle={workflow_handle}"
         if debug:
             print(f"[DEBUG] Exchanging workflowResultHandle at: {exchange_url}")
-        exch_resp = http_session.get(
+            print(f"[DEBUG] Exchange Origin:  {portal_origin}")
+            print(f"[DEBUG] Exchange Referer: {referer}")
+        # Must be POST (not GET), no body, query param only, same session (carries cookie)
+        exch_resp = http_session.post(
             exchange_url,
             params={"workflowResultHandle": workflow_handle},
             headers={
-                "Accept": "application/json, text/plain, */*",
-                "Referer": resp.url,
                 "Origin": portal_origin,
+                "Referer": referer,
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json",
             },
             allow_redirects=True,
             timeout=30,
