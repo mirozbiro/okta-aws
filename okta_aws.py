@@ -36,6 +36,49 @@ SAML_SESSION_ATTRIBUTE = "https://aws.amazon.com/SAML/Attributes/SessionDuration
 PUSH_POLL_INTERVAL = 3   # seconds between push-approval polls
 PUSH_POLL_TIMEOUT = 180  # seconds before giving up on a push
 
+# Okta Identity Engine (IDX) headers
+IDX_ACCEPT = "application/ion+json; okta-version=1.0.0"
+IDX_HEADERS = {
+    "Accept": IDX_ACCEPT,
+    "Content-Type": IDX_ACCEPT,
+}
+
+# ---------------------------------------------------------------------------
+# PKCE + IDX helpers
+# ---------------------------------------------------------------------------
+
+
+def _pkce_pair():
+    """Return (code_verifier, code_challenge) using S256 method."""
+    import hashlib
+    import secrets
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+def _idx_find_remediation(state, *names):
+    """Return (href, form_dict) for the first matching remediation name, else (None, None)."""
+    for rem in state.get("remediation", {}).get("value", []):
+        if rem.get("name") in names:
+            return rem.get("href"), rem
+    return None, None
+
+
+def _idx_get_session_token(state):
+    """Extract a Okta sessionToken from a terminal IDX state dict, or None."""
+    # Embedded IDX with short-lived session token
+    for key in ("session", "user"):
+        obj = state.get(key)
+        if isinstance(obj, dict):
+            tok = obj.get("token") or (obj.get("value") or {}).get("token")
+            if tok:
+                return tok
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Configuration helpers
 # ---------------------------------------------------------------------------
@@ -181,24 +224,298 @@ def _handle_push(okta_url, factor, state_token):
 
 
 # ---------------------------------------------------------------------------
-# SAML assertion retrieval
+# Okta Identity Engine (IDX) authentication
 # ---------------------------------------------------------------------------
 
 
-def get_saml_assertion(okta_url, app_url, session_token, debug=False):
+def okta_idx_authn(okta_url, client_id, username, password, debug=False):
+    """Authenticate via the Okta Identity Engine (IDX) pipeline.
+
+    Returns ``(session_token, requests_session)`` where:
+    - ``session_token`` is the short-lived Okta session token (str) if the
+      terminal IDX state exposes one, otherwise ``None``.
+    - ``requests_session`` is a :class:`requests.Session` that carries the
+      Okta session cookies set during the IDX flow.  When ``session_token``
+      is ``None`` the caller must use this session to fetch the SAML app URL
+      directly (the session is already authenticated).
+
+    Raises :class:`requests.HTTPError` or :class:`RuntimeError` on failure.
+    """
+    import hashlib  # noqa: F401 (used inside _pkce_pair)
+    import secrets
+
+    session = requests.Session()
+    state_val = base64.urlsafe_b64encode(secrets.token_bytes(16)).rstrip(b"=").decode()
+    nonce = base64.urlsafe_b64encode(secrets.token_bytes(16)).rstrip(b"=").decode()
+    code_verifier, code_challenge = _pkce_pair()
+    redirect_uri = "http://localhost:8080/login/callback"
+
+    # --- Step 1: obtain interactionHandle via /oauth2/v1/interact ---
+    if debug:
+        print(f"[IDX] POST {okta_url}/oauth2/v1/interact")
+    interact_resp = session.post(
+        f"{okta_url}/oauth2/v1/interact",
+        data={
+            "client_id": client_id,
+            "scope": "openid profile email",
+            "redirect_uri": redirect_uri,
+            "state": state_val,
+            "nonce": nonce,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        },
+        timeout=30,
+    )
+    if debug:
+        print(f"[IDX] interact status: {interact_resp.status_code} body: {interact_resp.text[:300]}")
+    interact_resp.raise_for_status()
+    interaction_handle = interact_resp.json().get("interaction_handle")
+    if not interaction_handle:
+        raise RuntimeError(
+            f"No interaction_handle returned from /oauth2/v1/interact. "
+            f"Verify --client-id is correct.\nResponse: {interact_resp.text[:300]}"
+        )
+
+    # --- Step 2: introspect to bootstrap the state machine ---
+    if debug:
+        print(f"[IDX] POST /idp/idx/introspect")
+    idx_resp = session.post(
+        f"{okta_url}/idp/idx/introspect",
+        json={"interactionHandle": interaction_handle},
+        headers=IDX_HEADERS,
+        timeout=30,
+    )
+    if debug:
+        print(f"[IDX] introspect status: {idx_resp.status_code}")
+    idx_resp.raise_for_status()
+    idx_state = idx_resp.json()
+
+    # --- Step 3: identify (username) ---
+    identify_href, identify_form = _idx_find_remediation(idx_state, "identify")
+    if not identify_href:
+        raise RuntimeError(
+            f"IDX: 'identify' remediation not found after introspect. "
+            f"Available: {[r.get('name') for r in idx_state.get('remediation', {}).get('value', [])]}"
+        )
+
+    # Some orgs allow password inline with identify; others require a separate step.
+    inline_pw = any(v.get("name") == "credentials"
+                    for v in (identify_form or {}).get("value", []))
+    identify_payload: dict = {"identifier": username, "rememberMe": False}
+    if inline_pw:
+        identify_payload["credentials"] = {"passcode": password}
+
+    if debug:
+        print(f"[IDX] POST identify → {identify_href}  (inline_password={inline_pw})")
+    idx_resp = session.post(identify_href, json=identify_payload, headers=IDX_HEADERS, timeout=30)
+    if debug:
+        print(f"[IDX] identify status: {idx_resp.status_code}")
+    idx_resp.raise_for_status()
+    idx_state = idx_resp.json()
+
+    # --- Step 4: select password authenticator (if required) ---
+    sel_href, sel_form = _idx_find_remediation(idx_state, "select-authenticator-authenticate")
+    if sel_href and not inline_pw:
+        pw_option = None
+        for fv in (sel_form or {}).get("value", []):
+            for opt in fv.get("options", []):
+                if opt.get("label", "").lower() == "password":
+                    pw_option = opt.get("value", {})
+                    break
+            if pw_option:
+                break
+        if not pw_option:
+            # take first option if password not explicitly found
+            for fv in (sel_form or {}).get("value", []):
+                opts = fv.get("options", [])
+                if opts:
+                    pw_option = opts[0].get("value", {})
+                    break
+        if debug:
+            print(f"[IDX] Selecting authenticator: {pw_option}")
+        idx_resp = session.post(
+            sel_href, json={"authenticator": pw_option}, headers=IDX_HEADERS, timeout=30
+        )
+        if debug:
+            print(f"[IDX] select-authenticator status: {idx_resp.status_code}")
+        idx_resp.raise_for_status()
+        idx_state = idx_resp.json()
+
+    # --- Step 5: answer password challenge ---
+    chal_href, _ = _idx_find_remediation(
+        idx_state, "challenge-factor", "authenticator-verification-data"
+    )
+    if chal_href and not inline_pw:
+        if debug:
+            print(f"[IDX] POST challenge-factor (password) → {chal_href}")
+        idx_resp = session.post(
+            chal_href,
+            json={"credentials": {"passcode": password}},
+            headers=IDX_HEADERS,
+            timeout=30,
+        )
+        if debug:
+            print(f"[IDX] challenge-factor status: {idx_resp.status_code}")
+        idx_resp.raise_for_status()
+        idx_state = idx_resp.json()
+
+    # --- Step 6: MFA (if any step requires it) ---
+    idx_state = _handle_idx_mfa(idx_state, session, debug)
+
+    # --- Step 7: read terminal state ---
+    session_token = _idx_get_session_token(idx_state)
+    if debug:
+        print(f"[IDX] Terminal sessionToken obtained: {bool(session_token)}")
+        print(f"[IDX] Session cookies after IDX: {[c.name for c in session.cookies]}")
+
+    return session_token, session
+
+
+def _handle_idx_mfa(idx_state, session, debug=False):
+    """Consume MFA remediations in the IDX state machine.  Returns updated state."""
+    enroll_href, _ = _idx_find_remediation(idx_state, "select-authenticator-enroll")
+    if enroll_href:
+        print("MFA enrollment is required. Please enroll a factor in Okta first.")
+        sys.exit(1)
+
+    for _ in range(8):  # guard against infinite loops
+        # Is there a pending authenticator selection (non-password MFA)?
+        sel_href, sel_form = _idx_find_remediation(idx_state, "select-authenticator-authenticate")
+        chal_href, chal_form = _idx_find_remediation(idx_state, "challenge-factor")
+
+        if not sel_href and not chal_href:
+            break  # no more MFA steps
+
+        if chal_href:
+            # Determine what type: look for push vs TOTP
+            factor_type = ""
+            for fv in (chal_form or {}).get("value", []):
+                if fv.get("name") == "credentials":
+                    factor_type = "totp"
+
+            if factor_type == "push":
+                # Okta Verify push
+                print("Sending push notification to Okta Verify… please approve it.", flush=True)
+                idx_resp = session.post(
+                    chal_href, json={}, headers=IDX_HEADERS, timeout=30
+                )
+                idx_resp.raise_for_status()
+                idx_state = idx_resp.json()
+                # Poll
+                deadline = time.time() + PUSH_POLL_TIMEOUT
+                while True:
+                    poll_href, _ = _idx_find_remediation(idx_state, "challenge-poll")
+                    if not poll_href:
+                        break
+                    if time.time() > deadline:
+                        print("\nPush notification timed out.")
+                        sys.exit(1)
+                    print(".", end="", flush=True)
+                    time.sleep(PUSH_POLL_INTERVAL)
+                    idx_resp = session.post(poll_href, json={}, headers=IDX_HEADERS, timeout=30)
+                    idx_resp.raise_for_status()
+                    idx_state = idx_resp.json()
+                print()
+            else:
+                # TOTP / SMS / email code
+                code = input("Enter MFA code: ").strip()
+                idx_resp = session.post(
+                    chal_href,
+                    json={"credentials": {"passcode": code}},
+                    headers=IDX_HEADERS,
+                    timeout=30,
+                )
+                if debug:
+                    print(f"[IDX] MFA challenge answer status: {idx_resp.status_code}")
+                idx_resp.raise_for_status()
+                idx_state = idx_resp.json()
+
+        elif sel_href:
+            # Need to select a non-password MFA factor
+            options = []
+            for fv in (sel_form or {}).get("value", []):
+                for opt in fv.get("options", []):
+                    if opt.get("label", "").lower() not in ("password",):
+                        options.append(opt)
+            if not options:
+                break
+            if len(options) == 1:
+                chosen = options[0]
+            else:
+                print("\nAvailable MFA authenticators:")
+                for i, opt in enumerate(options):
+                    print(f"  [{i + 1}] {opt.get('label', 'unknown')}")
+                while True:
+                    try:
+                        idx = int(input("Select MFA: ").strip()) - 1
+                        if 0 <= idx < len(options):
+                            chosen = options[idx]
+                            break
+                    except ValueError:
+                        pass
+                    print("Invalid selection.")
+            if debug:
+                print(f"[IDX] Selecting MFA authenticator: {chosen.get('label')}")
+            idx_resp = session.post(
+                sel_href,
+                json={"authenticator": chosen.get("value", {})},
+                headers=IDX_HEADERS,
+                timeout=30,
+            )
+            if debug:
+                print(f"[IDX] MFA authenticator select status: {idx_resp.status_code}")
+            idx_resp.raise_for_status()
+            idx_state = idx_resp.json()
+
+    return idx_state
+
+
+
+
+
+def get_saml_assertion(okta_url, app_url, session_token=None, authed_session=None, debug=False):
     """Retrieve the base64-encoded SAML assertion from the Okta AWS app.
 
-    Two strategies are tried:
-    1. Exchange the session token for a cookie via /login/sessionCookieRedirect,
-       then follow redirects to the app.
-    2. Append the session token directly to the app URL as a query parameter.
+    Two modes of operation:
 
-    Returns (saml_assertion, action_url, http_session).
-      - saml_assertion: raw base64 SAML assertion string
-      - action_url: the form POST target URL (AWS SSO ACS or signin.aws.amazon.com/saml)
-      - http_session: the requests.Session with any established cookies
-    Raises ValueError when no SAMLResponse form field is found.
+    **IDX mode** (``authed_session`` provided): The caller supplies a
+    :class:`requests.Session` that is already authenticated via the IDX
+    pipeline (it carries Okta session cookies).  The app URL is fetched
+    directly with that session — no sessionCookieRedirect needed.
+
+    **Classic mode** (``session_token`` provided): A fresh session is
+    created and two strategies are tried:
+    1. Exchange the token via ``/login/sessionCookieRedirect``.
+    2. Append the token as ``?sessionToken=`` query parameter.
+
+    Returns ``(saml_assertion, action_url, http_session)``.
+    Raises :class:`ValueError` when no SAMLResponse form field is found.
     """
+    if authed_session is not None:
+        # ---- IDX path: session already carries Okta cookies ----
+        session = authed_session
+        if debug:
+            print(f"[DEBUG] IDX mode: GET {app_url} with pre-authenticated session")
+        resp = session.get(app_url, allow_redirects=True, timeout=30)
+        if debug:
+            print(f"[DEBUG] Final URL after redirects: {resp.url}")
+            print(f"[DEBUG] HTTP status: {resp.status_code}")
+            print(f"[DEBUG] Redirect chain: {[r.url for r in resp.history]}")
+            print(f"[DEBUG] Response HTML (first 3000 chars):\n{resp.text[:3000]}")
+        resp.raise_for_status()
+        saml_assertion, action_url = _extract_saml_form(resp.text)
+        if debug:
+            print(f"[DEBUG] SAMLResponse found (IDX direct): {bool(saml_assertion)}")
+            print(f"[DEBUG] Form action URL: {action_url}")
+        if not saml_assertion:
+            raise ValueError(
+                "IDX mode: could not find SAMLResponse in Okta app response. "
+                "Verify --app-url is the embed link for the AWS SSO app and that "
+                "the --client-id belongs to an Okta app with access to it."
+            )
+        return saml_assertion, action_url, session
+
+    # ---- Classic path: exchange session token for cookie ----
     session = requests.Session()
 
     # Strategy 1: session cookie exchange
@@ -904,6 +1221,7 @@ Examples:
   okta-aws --account 123456789012       Pre-select an AWS account
   okta-aws --account 123456789012 \\
            --role MyRole                Pre-select account and role (no prompts)
+  okta-aws --client-id 0oa...           Use Okta Identity Engine (IDX) auth
 """,
     )
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH,
@@ -915,6 +1233,10 @@ Examples:
                         help="Okta organization URL, e.g. https://corp.okta.com")
     parser.add_argument("--app-url",
                         help="Okta AWS app embed link URL")
+    parser.add_argument("--client-id",
+                        help="Okta OIDC application client ID — enables Identity Engine (IDX) "
+                             "authentication instead of the deprecated /api/v1/authn API. "
+                             "Set 'client_id' in ~/.okta-aws to avoid passing it every time.")
     parser.add_argument("--region", help="AWS region written to ~/.aws/credentials (default: us-east-1)")
     parser.add_argument("--sso-region",
                         help="AWS SSO / IAM Identity Center region (default: us-east-1)")
@@ -946,6 +1268,7 @@ def main():
     okta_url = cf("okta_url", args.okta_url)
     app_url = cf("app_url", args.app_url)
     username = cf("username", args.username)
+    client_id = cf("client_id", args.client_id)  # optional — enables IDX flow
     profile = cf("profile", args.profile, DEFAULT_PROFILE)
     region = cf("region", args.region, "us-east-1")
     sso_region = cf("sso_region", args.sso_region, None)  # will be inferred from ACS url if not set
@@ -968,52 +1291,89 @@ def main():
     print(f"\nAuthenticating to {okta_url} as {username}…")
     password = getpass.getpass("Password: ")
 
-    # --- Primary authentication ---
-    try:
-        authn_result = okta_authn(okta_url, username, password)
-    except requests.HTTPError as exc:
-        status_code = exc.response.status_code
-        if status_code == 401:
-            print("Authentication failed: invalid username or password.")
-        elif status_code == 429:
-            print("Authentication failed: too many requests — please wait and retry.")
-        else:
-            print(f"Authentication failed: HTTP {status_code}.")
-        sys.exit(1)
+    # -----------------------------------------------------------------------
+    # Authentication: IDX (Identity Engine) when --client-id is set, else
+    # fall back to the classic /api/v1/authn pipeline.
+    # -----------------------------------------------------------------------
+    idx_session = None   # requests.Session pre-authenticated via IDX
+    session_token = None
 
-    status = authn_result.get("status")
+    if client_id:
+        # ---- Okta Identity Engine (IDX) path ----
+        print("Using Okta Identity Engine (IDX) authentication…")
+        try:
+            session_token, idx_session = okta_idx_authn(
+                okta_url, client_id, username, password, debug=args.debug
+            )
+        except requests.HTTPError as exc:
+            sc = exc.response.status_code if exc.response is not None else "?"
+            if sc == 400:
+                print(
+                    f"IDX authentication failed (HTTP 400). "
+                    f"Check --client-id is a Native/SPA app in this Okta org.\n"
+                    f"Response: {exc.response.text[:300]}"
+                )
+            elif sc == 401:
+                print("IDX authentication failed: invalid credentials.")
+            else:
+                print(f"IDX authentication failed: HTTP {sc}.")
+            sys.exit(1)
+        except RuntimeError as exc:
+            print(f"IDX authentication failed: {exc}")
+            sys.exit(1)
+        print("Okta authentication successful (IDX).")
+    else:
+        # ---- Classic /api/v1/authn path ----
+        if args.debug:
+            print("[DEBUG] No --client-id set; using classic /api/v1/authn")
+        try:
+            authn_result = okta_authn(okta_url, username, password)
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code
+            if status_code == 401:
+                print("Authentication failed: invalid username or password.")
+            elif status_code == 429:
+                print("Authentication failed: too many requests — please wait and retry.")
+            else:
+                print(f"Authentication failed: HTTP {status_code}.")
+            sys.exit(1)
 
-    if status == "LOCKED_OUT":
-        print("Your account is locked out. Please contact your administrator.")
-        sys.exit(1)
-    if status == "PASSWORD_EXPIRED":
-        print("Your password has expired. Please reset it in Okta and try again.")
-        sys.exit(1)
-    if status == "MFA_ENROLL":
-        print("MFA enrollment is required. Please enroll a factor in Okta first.")
-        sys.exit(1)
-
-    if status in ("MFA_REQUIRED", "MFA_CHALLENGE"):
-        print("MFA verification required.")
-        authn_result = handle_mfa(okta_url, authn_result)
         status = authn_result.get("status")
 
-    if status != "SUCCESS":
-        print(f"Authentication failed with unexpected status: {status}")
-        sys.exit(1)
+        if status == "LOCKED_OUT":
+            print("Your account is locked out. Please contact your administrator.")
+            sys.exit(1)
+        if status == "PASSWORD_EXPIRED":
+            print("Your password has expired. Please reset it in Okta and try again.")
+            sys.exit(1)
+        if status == "MFA_ENROLL":
+            print("MFA enrollment is required. Please enroll a factor in Okta first.")
+            sys.exit(1)
 
-    session_token = authn_result.get("sessionToken")
-    if not session_token:
-        print("Okta did not return a session token. Check your credentials and try again.")
-        sys.exit(1)
+        if status in ("MFA_REQUIRED", "MFA_CHALLENGE"):
+            print("MFA verification required.")
+            authn_result = handle_mfa(okta_url, authn_result)
+            status = authn_result.get("status")
 
-    print("Okta authentication successful.")
+        if status != "SUCCESS":
+            print(f"Authentication failed with unexpected status: {status}")
+            sys.exit(1)
+
+        session_token = authn_result.get("sessionToken")
+        if not session_token:
+            print("Okta did not return a session token. Check your credentials and try again.")
+            sys.exit(1)
+
+        print("Okta authentication successful.")
 
     # --- SAML assertion ---
     print("Retrieving SAML assertion from AWS app…")
     try:
         saml_assertion, action_url, http_session = get_saml_assertion(
-            okta_url, app_url, session_token, debug=args.debug
+            okta_url, app_url,
+            session_token=session_token,
+            authed_session=idx_session,
+            debug=args.debug,
         )
     except Exception as exc:
         print(f"Failed to retrieve SAML assertion: {exc}")
