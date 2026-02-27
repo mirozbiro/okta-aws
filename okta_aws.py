@@ -1078,48 +1078,52 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
     expires_min = expires_in // 60
     box_inner = 0  # set once the box is opened
 
-    while time.time() < deadline:
-        try:
-            token_resp = sso_oidc.create_token(
-                clientId=client_id,
-                clientSecret=client_secret,
-                grantType="urn:ietf:params:oauth:grant-type:device_code",
-                deviceCode=device_code,
-            )
-            if debug:
-                print("[DEBUG] SSO OIDC access token obtained successfully.")
-            return token_resp["accessToken"]
-
-        except sso_oidc.exceptions.AuthorizationPendingException:
-            if not prompted:
-                box_inner = _print_box_open(
-                    "AWS SSO authorization required",
-                    [
-                        "Open this URL in your browser  (Ctrl+click works in VS Code):",
-                        "",
-                        verify_url,
-                        "",
-                        f"User code: {user_code}  (pre-filled in the URL above)",
-                        "",
-                        "Click  Allow  in the portal, then return here.",
-                        "",
-                    ],
+    try:
+        while time.time() < deadline:
+            try:
+                token_resp = sso_oidc.create_token(
+                    clientId=client_id,
+                    clientSecret=client_secret,
+                    grantType="urn:ietf:params:oauth:grant-type:device_code",
+                    deviceCode=device_code,
                 )
-                prompted = True
-                first_bar = True
-            remaining = max(0, int(deadline - time.time()))
-            _draw_bar_line(box_inner, remaining, expires_in, first=first_bar)
-            first_bar = False
-            time.sleep(interval)
+                if debug:
+                    print("[DEBUG] SSO OIDC access token obtained successfully.")
+                return token_resp["accessToken"]
 
-        except sso_oidc.exceptions.SlowDownException:
-            interval = min(interval + 5, 30)
-            time.sleep(interval)
+            except sso_oidc.exceptions.AuthorizationPendingException:
+                if not prompted:
+                    box_inner = _print_box_open(
+                        "AWS SSO authorization required",
+                        [
+                            "Open this URL in your browser  (Ctrl+click works in VS Code):",
+                            "",
+                            verify_url,
+                            "",
+                            f"User code: {user_code}  (pre-filled in the URL above)",
+                            "",
+                            "Click  Allow  in the portal, then return here.",
+                            "",
+                        ],
+                    )
+                    prompted = True
+                    first_bar = True
+                remaining = max(0, int(deadline - time.time()))
+                _draw_bar_line(box_inner, remaining, expires_in, first=first_bar)
+                first_bar = False
+                time.sleep(interval)
 
-        except Exception as exc:
-            if debug:
-                print(f"\n[DEBUG] create_token error: {type(exc).__name__}: {exc}")
-            time.sleep(interval)
+            except sso_oidc.exceptions.SlowDownException:
+                interval = min(interval + 5, 30)
+                time.sleep(interval)
+
+            except Exception as exc:
+                if debug:
+                    print(f"\n[DEBUG] create_token error: {type(exc).__name__}: {exc}")
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n\n  ✖ Authorization cancelled by user.")
+        raise RuntimeError("Authorization cancelled by user.")
 
     if prompted:
         _draw_bar_line(box_inner, 0, expires_in, first=first_bar)
@@ -1719,4 +1723,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n  ✖ Cancelled by user.")
+        sys.exit(130)
