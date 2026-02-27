@@ -82,13 +82,11 @@ def _print_box_close(inner):
 
 
 def _draw_bar_line(inner, remaining, total, first=False):
-    """Print (or redraw) a depleting progress bar inside an open box.
+    """Print (or redraw) a depleting progress bar and bottom border.
 
-    On the first call (*first=True*) it simply prints the bar with a trailing
-    newline so the terminal scrolls normally.  On subsequent calls it emits
-    ANSI cursor-up (``\\033[1A``) before rewriting, so the net terminal scroll
-    per tick is zero and the bar updates in-place without drifting to the
-    bottom of the window.
+    The first call prints a new bar line + border + trailing blank line.
+    Subsequent calls move cursor up 3 lines and rewrite those same 3 lines.
+    This keeps the bottom border visible throughout the countdown.
     """
     time_str = f"  {remaining // 60}m {remaining % 60:02d}s remaining"
     content_width = inner - 2
@@ -98,11 +96,14 @@ def _draw_bar_line(inner, remaining, total, first=False):
     bar = "\u2588" * filled + "\u2591" * empty
     content = bar + time_str
     line = f"\u2502  {content:<{content_width}}  \u2502"
+    bottom = f"\u2514{'\u2500' * (inner + 2)}\u2518"
     if first:
         print(line)
+        print(bottom)
+        print()
     else:
-        # Cursor up one line, carriage return, overwrite, then newline
-        print(f"\033[1A\r{line}")
+        # Move to previous bar line, redraw bar + border + trailing blank line.
+        print(f"\033[3A\r{line}\n{bottom}\n")
 
 
 def _step(msg):
@@ -1085,8 +1086,6 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
                 grantType="urn:ietf:params:oauth:grant-type:device_code",
                 deviceCode=device_code,
             )
-            if prompted:
-                _print_box_close(box_inner)
             if debug:
                 print("[DEBUG] SSO OIDC access token obtained successfully.")
             return token_resp["accessToken"]
@@ -1123,8 +1122,7 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
             time.sleep(interval)
 
     if prompted:
-        _draw_bar_line(box_inner, 0, expires_in)
-        _print_box_close(box_inner)
+        _draw_bar_line(box_inner, 0, expires_in, first=first_bar)
     raise RuntimeError(
         f"  ✖  Authorization link expired after {expires_min} minute{'s' if expires_min != 1 else ''}. "
         "Re-run the script to get a fresh link."
