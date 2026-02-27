@@ -188,8 +188,30 @@ def _choose_factor(factors):
         print("  Invalid selection — enter a number from the list.")
 
 
+def _is_wrong_code(http_error):
+    """Return True when the HTTPError is Okta's 'invalid passcode' response."""
+    resp = http_error.response
+    if resp is None:
+        return False
+    if resp.status_code not in (400, 403):
+        return False
+    try:
+        code = resp.json().get("errorCode", "")
+        # E0000068 = invalid passcode/answer, E0000079 = too many attempts
+        return code in ("E0000068", "E0000079") or "passcode" in resp.text.lower()
+    except Exception:
+        return False
+
+
+MFA_MAX_ATTEMPTS = 3
+
+
 def handle_mfa(okta_url, authn_result):
-    """Handle the MFA challenge and return the authn result after success."""
+    """Handle the MFA challenge and return the authn result after success.
+
+    Re-prompts up to MFA_MAX_ATTEMPTS times on an incorrect code instead of
+    crashing so the user can correct a typo without re-running the script.
+    """
     state_token = authn_result["stateToken"]
     factors = authn_result["_embedded"]["factors"]
     factor = _choose_factor(factors)
@@ -198,25 +220,35 @@ def handle_mfa(okta_url, authn_result):
     if factor_type == "push":
         return _handle_push(okta_url, factor, state_token)
 
-    if factor_type in ("token:software:totp", "token:hotp"):
-        passcode = input("Enter TOTP code: ").strip()
-        return okta_mfa_verify(okta_url, factor, state_token, passcode)
-
     if factor_type == "sms":
-        print("Sending SMS code...")
+        print("  Sending SMS code…")
         okta_mfa_verify(okta_url, factor, state_token)
-        passcode = input("Enter SMS code: ").strip()
-        return okta_mfa_verify(okta_url, factor, state_token, passcode)
 
     if factor_type == "email":
-        print("Sending email code...")
+        print("  Sending email code…")
         okta_mfa_verify(okta_url, factor, state_token)
-        passcode = input("Enter email code: ").strip()
-        return okta_mfa_verify(okta_url, factor, state_token, passcode)
 
-    # Generic fallback for any other factor type
-    passcode = input(f"Enter code for {factor_type}: ").strip()
-    return okta_mfa_verify(okta_url, factor, state_token, passcode)
+    prompt = {
+        "token:software:totp": "  TOTP code: ",
+        "token:hotp":          "  HOTP code: ",
+        "sms":                 "  SMS code: ",
+        "email":               "  Email code: ",
+    }.get(factor_type, f"  Code ({factor_type}): ")
+
+    for attempt in range(1, MFA_MAX_ATTEMPTS + 1):
+        passcode = input(prompt).strip()
+        try:
+            return okta_mfa_verify(okta_url, factor, state_token, passcode)
+        except requests.HTTPError as exc:
+            if _is_wrong_code(exc):
+                remaining = MFA_MAX_ATTEMPTS - attempt
+                if remaining > 0:
+                    print(f"  Incorrect code — {remaining} attempt{'s' if remaining != 1 else ''} left.")
+                else:
+                    print("  Incorrect code — no attempts remaining.")
+                    sys.exit(1)
+            else:
+                raise  # unexpected HTTP error — propagate normally
 
 
 def _handle_push(okta_url, factor, state_token):
@@ -435,6 +467,16 @@ def _idx_is_push(chal_form):
     return True  # no credentials field → treat as push / number-challenge
 
 
+def _idx_print_messages(state):
+    """Print any user-facing messages embedded in an IDX state response."""
+    for msg_obj in state.get("messages", {}).get("value", []):
+        text = msg_obj.get("message", "")
+        cls = msg_obj.get("class", "INFO").upper()
+        if text:
+            prefix = "  ✖  " if cls == "ERROR" else "  ℹ  "
+            print(f"{prefix}{text}")
+
+
 def _handle_idx_mfa(idx_state, session, debug=False):
     """Consume MFA remediations in the IDX state machine.  Returns updated state."""
     enroll_href, _ = _idx_find_remediation(idx_state, "select-authenticator-enroll")
@@ -498,7 +540,8 @@ def _handle_idx_mfa(idx_state, session, debug=False):
                     print("Sending push notification to Okta Verify… please approve it.", flush=True)
                 elif ans_href:
                     # Code-based MFA (TOTP / SMS / email)
-                    code = input("Enter MFA code: ").strip()
+                    _idx_print_messages(idx_state)
+                    code = input("  MFA code: ").strip()
                     if debug:
                         print(f"[IDX] POST challenge/answer → {ans_href}")
                     idx_resp = session.post(
@@ -526,7 +569,8 @@ def _handle_idx_mfa(idx_state, session, debug=False):
                     print("Sending push notification to Okta Verify… please approve it.", flush=True)
                     _handle_idx_mfa._deadline = time.time() + PUSH_POLL_TIMEOUT  # type: ignore[attr-defined]
                 else:
-                    code = input("Enter MFA code: ").strip()
+                    _idx_print_messages(idx_state)
+                    code = input("  MFA code: ").strip()
                     if debug:
                         print(f"[IDX] POST challenge/answer → {chal_href}")
                     idx_resp = session.post(
@@ -552,12 +596,12 @@ def _handle_idx_mfa(idx_state, session, debug=False):
             if len(options) == 1:
                 chosen = options[0]
             else:
-                print("\nAvailable MFA authenticators:")
+                print("\n  Available MFA authenticators:\n")
                 for i, opt in enumerate(options):
-                    print(f"  [{i + 1}] {opt.get('label', 'unknown')}")
+                    print(f"  [{i + 1:>2}]  {opt.get('label', 'unknown')}")
                 while True:
                     try:
-                        pick = int(input("Select MFA: ").strip()) - 1
+                        pick = int(input("\n  Select MFA: ").strip()) - 1
                         if 0 <= pick < len(options):
                             chosen = options[pick]
                             break
