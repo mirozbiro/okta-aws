@@ -1025,6 +1025,7 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
 
     deadline = time.time() + expires_in
     prompted = False
+    expires_min = expires_in // 60
 
     while time.time() < deadline:
         try:
@@ -1052,12 +1053,16 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
                         f"User code: {user_code}  (pre-filled in the URL above)",
                         "",
                         "Click  Allow  in the portal, then return here.",
+                        "",
+                        f"Link expires in {expires_min} minute{'s' if expires_min != 1 else ''}.",
                     ],
                 )
                 print("Waiting for approval", end="", flush=True)
                 prompted = True
             else:
-                print(".", end="", flush=True)
+                remaining = max(0, int(deadline - time.time()))
+                # Rewrite the waiting line every poll so the countdown is visible
+                print(f"\r  Waiting for approval  ({remaining:>3}s remaining) ", end="", flush=True)
             time.sleep(interval)
 
         except sso_oidc.exceptions.SlowDownException:
@@ -1069,9 +1074,10 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
                 print(f"\n[DEBUG] create_token error: {type(exc).__name__}: {exc}")
             time.sleep(interval)
 
+    print()  # newline after countdown
     raise RuntimeError(
-        f"Device authorization not approved within {expires_in} seconds. "
-        "Re-run the script and approve the URL shown above."
+        f"  ✖  Authorization link expired after {expires_min} minute{'s' if expires_min != 1 else ''}. "
+        "Re-run the script to get a fresh link."
     )
 
 
