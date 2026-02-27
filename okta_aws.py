@@ -57,6 +57,43 @@ def _print_box(title, lines):
     print(f"└{'─' * (inner + 2)}┘\n")
 
 
+def _print_box_open(title, lines):
+    """Print the top + body of a box without the bottom border.
+
+    Returns *inner* — the usable character width inside the box, needed to
+    render the live bar line with :func:`_draw_bar_line` and to close the box
+    with :func:`_print_box_close`.
+    """
+    max_line = max((len(l) for l in lines), default=0)
+    inner = max(len(title) + 2, max_line + 2)
+    print(f"\n┌─ {title} {'─' * (inner - len(title) - 1)}┐")
+    for line in lines:
+        print(f"│  {line}{' ' * (inner - len(line) - 2)}  │")
+    return inner
+
+
+def _print_box_close(inner):
+    """Print the bottom border that closes a box opened with :func:`_print_box_open`."""
+    print(f"\n└{'─' * (inner + 2)}┘\n")
+
+
+def _draw_bar_line(inner, remaining, total):
+    """Overwrite the current terminal line with a depleting progress bar.
+
+    Renders as:  │  ████████████░░░░░  8m 32s remaining  │
+    Uses \\r so the line is rewritten in place on every tick.
+    """
+    time_str = f"  {remaining // 60}m {remaining % 60:02d}s remaining"
+    # Content area = inner - 2  (inner already excludes the side spaces in _print_box_open)
+    content_width = inner - 2
+    bar_width = max(1, content_width - len(time_str))
+    filled = int(bar_width * remaining / max(total, 1))
+    empty = bar_width - filled
+    bar = "█" * filled + "░" * empty
+    content = bar + time_str
+    print(f"\r│  {content:<{content_width}}  │", end="", flush=True)
+
+
 def _step(msg):
     """Print an in-progress step line."""
     print(f"  →  {msg}")
@@ -1026,6 +1063,7 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
     deadline = time.time() + expires_in
     prompted = False
     expires_min = expires_in // 60
+    box_inner = 0  # set once the box is opened
 
     while time.time() < deadline:
         try:
@@ -1036,14 +1074,14 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
                 deviceCode=device_code,
             )
             if prompted:
-                print()  # newline after dot-animation
+                _print_box_close(box_inner)
             if debug:
                 print("[DEBUG] SSO OIDC access token obtained successfully.")
             return token_resp["accessToken"]
 
         except sso_oidc.exceptions.AuthorizationPendingException:
             if not prompted:
-                _print_box(
+                box_inner = _print_box_open(
                     "AWS SSO authorization required",
                     [
                         "Open this URL in your browser  (Ctrl+click works in VS Code):",
@@ -1054,15 +1092,11 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
                         "",
                         "Click  Allow  in the portal, then return here.",
                         "",
-                        f"Link expires in {expires_min} minute{'s' if expires_min != 1 else ''}.",
                     ],
                 )
-                print("Waiting for approval", end="", flush=True)
                 prompted = True
-            else:
-                remaining = max(0, int(deadline - time.time()))
-                # Rewrite the waiting line every poll so the countdown is visible
-                print(f"\r  Waiting for approval  ({remaining:>3}s remaining) ", end="", flush=True)
+            remaining = max(0, int(deadline - time.time()))
+            _draw_bar_line(box_inner, remaining, expires_in)
             time.sleep(interval)
 
         except sso_oidc.exceptions.SlowDownException:
@@ -1074,7 +1108,9 @@ def get_sso_access_token_via_device_auth(portal_origin, sso_region, http_session
                 print(f"\n[DEBUG] create_token error: {type(exc).__name__}: {exc}")
             time.sleep(interval)
 
-    print()  # newline after countdown
+    if prompted:
+        _draw_bar_line(box_inner, 0, expires_in)
+        _print_box_close(box_inner)
     raise RuntimeError(
         f"  ✖  Authorization link expired after {expires_min} minute{'s' if expires_min != 1 else ''}. "
         "Re-run the script to get a fresh link."
