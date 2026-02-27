@@ -478,28 +478,56 @@ def submit_saml_to_sso(action_url, saml_assertion, http_session, debug=False):
     if debug:
         print(f"[DEBUG] Inferred SSO region from action_url: {sso_region}")
 
-    return token, sso_region
+    # Extract the portal origin from the final redirect URL.
+    # e.g. https://d-936777ef92.awsapps.com/start/?workflowResultHandle=...
+    # -> https://d-936777ef92.awsapps.com
+    from urllib.parse import urlparse
+    parsed = urlparse(resp.url)
+    portal_origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    if debug:
+        print(f"[DEBUG] Portal origin (awsapps.com): {portal_origin}")
+
+    # The auth cookie is domain-scoped to eu-west-1.signin.aws but needs to reach
+    # portal.sso.REGION.amazonaws.com.  Register it explicitly on the portal domain
+    # so requests will include it automatically when calling that host.
+    portal_domain = f"portal.sso.{sso_region}.amazonaws.com"
+    import urllib.parse as _up
+    decoded_token = _up.unquote(token)
+    from requests.cookies import create_cookie
+    for cookie_name in (token_name_found, "aws-usi-authn", "x-amz-sso_authn"):
+        if cookie_name:
+            http_session.cookies.set_cookie(
+                create_cookie(cookie_name, decoded_token,
+                              domain=portal_domain, path="/")
+            )
+
+    if debug:
+        print(f"[DEBUG] Registered auth cookie on portal domain: {portal_domain}")
+
+    return token, sso_region, portal_origin, http_session
 
 
-def list_sso_accounts_and_roles(sso_token, sso_region, debug=False):
+def list_sso_accounts_and_roles(sso_token, sso_region, portal_origin, http_session, debug=False):
     """Return a flat list of dicts with keys: account_id, account_name, role_name.
 
     Uses the Access Portal REST API (portal.sso.REGION.amazonaws.com) with the
-    aws-usi-authn / x-amz-sso_authn portal session token as bearer auth.
-    Falls back to the boto3 SSO client (which requires an OIDC access token).
+    aws-usi-authn portal session token via bearer header and cookie.
     """
     import urllib.parse
-    # The portal session token may be URL-encoded; decode it
     decoded_token = urllib.parse.unquote(sso_token)
 
     portal_base = f"https://portal.sso.{sso_region}.amazonaws.com"
     headers = {
         "x-amz-sso-bearer-token": decoded_token,
         "Accept": "application/json",
+        "Origin": portal_origin,
+        "Referer": f"{portal_origin}/start/",
     }
 
     if debug:
         print(f"[DEBUG] Calling portal REST API: {portal_base}/assignment/accounts")
+        print(f"[DEBUG] Origin: {portal_origin}")
 
     # List accounts
     accounts = []
@@ -508,7 +536,7 @@ def list_sso_accounts_and_roles(sso_token, sso_region, debug=False):
         params = {"max_result": "100"}
         if next_token:
             params["next_token"] = next_token
-        resp = requests.get(
+        resp = http_session.get(
             f"{portal_base}/assignment/accounts",
             headers=headers,
             params=params,
@@ -528,13 +556,12 @@ def list_sso_accounts_and_roles(sso_token, sso_region, debug=False):
     for acct in accounts:
         acct_id = acct["accountId"]
         acct_name = acct.get("accountName", acct_id)
-        # List roles for this account
         role_next = None
         while True:
             params = {"max_result": "100"}
             if role_next:
                 params["next_token"] = role_next
-            resp = requests.get(
+            resp = http_session.get(
                 f"{portal_base}/assignment/accounts/{acct_id}/roles",
                 headers=headers,
                 params=params,
@@ -557,11 +584,11 @@ def list_sso_accounts_and_roles(sso_token, sso_region, debug=False):
     return entries
 
 
-def get_sso_role_credentials(sso_token, sso_region, account_id, role_name, debug=False):
+def get_sso_role_credentials(sso_token, sso_region, account_id, role_name,
+                              portal_origin=None, http_session=None, debug=False):
     """Get temporary credentials via the Access Portal REST API.
 
-    Calls portal.sso.REGION.amazonaws.com/federation/credentials, which
-    returns short-lived STS-style credentials using the portal session token.
+    Calls portal.sso.REGION.amazonaws.com/federation/credentials.
     """
     import urllib.parse
     decoded_token = urllib.parse.unquote(sso_token)
@@ -571,12 +598,17 @@ def get_sso_role_credentials(sso_token, sso_region, account_id, role_name, debug
         "x-amz-sso-bearer-token": decoded_token,
         "Accept": "application/json",
     }
-    params = {"account_id": account_id, "role_name": role_name, "debug": "true"}
+    if portal_origin:
+        headers["Origin"] = portal_origin
+        headers["Referer"] = f"{portal_origin}/start/"
+
+    params = {"account_id": account_id, "role_name": role_name}
 
     if debug:
         print(f"[DEBUG] Calling: {portal_base}/federation/credentials")
 
-    resp = requests.get(
+    requester = http_session if http_session else requests
+    resp = requester.get(
         f"{portal_base}/federation/credentials",
         headers=headers,
         params=params,
@@ -964,7 +996,7 @@ def main():
         # ---- AWS IAM Identity Center (SSO) path ----
         print("Detected AWS IAM Identity Center (SSO) portal. Completing SSO login…")
         try:
-            sso_token, inferred_sso_region = submit_saml_to_sso(
+            sso_token, inferred_sso_region, portal_origin, sso_http_session = submit_saml_to_sso(
                 action_url, saml_assertion, http_session, debug=args.debug
             )
         except Exception as exc:
@@ -977,7 +1009,10 @@ def main():
 
         print("Listing SSO accounts and roles…")
         try:
-            entries = list_sso_accounts_and_roles(sso_token, effective_sso_region, debug=args.debug)
+            entries = list_sso_accounts_and_roles(
+                sso_token, effective_sso_region, portal_origin, sso_http_session,
+                debug=args.debug
+            )
         except Exception as exc:
             print(f"Failed to list SSO accounts/roles: {exc}")
             sys.exit(1)
@@ -993,6 +1028,8 @@ def main():
             credentials = get_sso_role_credentials(
                 sso_token, effective_sso_region,
                 selected["account_id"], selected["role_name"],
+                portal_origin=portal_origin,
+                http_session=sso_http_session,
                 debug=args.debug,
             )
         except Exception as exc:
