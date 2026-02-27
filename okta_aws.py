@@ -481,32 +481,120 @@ def submit_saml_to_sso(action_url, saml_assertion, http_session, debug=False):
     return token, sso_region
 
 
-def list_sso_accounts_and_roles(sso_token, sso_region):
+def list_sso_accounts_and_roles(sso_token, sso_region, debug=False):
     """Return a flat list of dicts with keys: account_id, account_name, role_name.
 
-    Uses boto3 SSO client with the short-lived portal token — no credentials needed.
+    Uses the Access Portal REST API (portal.sso.REGION.amazonaws.com) with the
+    aws-usi-authn / x-amz-sso_authn portal session token as bearer auth.
+    Falls back to the boto3 SSO client (which requires an OIDC access token).
     """
-    client = boto3.client("sso", region_name=sso_region)
+    import urllib.parse
+    # The portal session token may be URL-encoded; decode it
+    decoded_token = urllib.parse.unquote(sso_token)
+
+    portal_base = f"https://portal.sso.{sso_region}.amazonaws.com"
+    headers = {
+        "x-amz-sso-bearer-token": decoded_token,
+        "Accept": "application/json",
+    }
+
+    if debug:
+        print(f"[DEBUG] Calling portal REST API: {portal_base}/assignment/accounts")
+
+    # List accounts
     accounts = []
-    paginator = client.get_paginator("list_accounts")
-    for page in paginator.paginate(accessToken=sso_token):
-        accounts.extend(page["accountList"])
+    next_token = None
+    while True:
+        params = {"max_result": "100"}
+        if next_token:
+            params["next_token"] = next_token
+        resp = requests.get(
+            f"{portal_base}/assignment/accounts",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+        if debug:
+            print(f"[DEBUG] list accounts status: {resp.status_code}")
+            print(f"[DEBUG] list accounts response: {resp.text[:1000]}")
+        resp.raise_for_status()
+        data = resp.json()
+        accounts.extend(data.get("accountList", []))
+        next_token = data.get("nextToken")
+        if not next_token:
+            break
 
     entries = []
     for acct in accounts:
-        role_paginator = client.get_paginator("list_account_roles")
-        for page in role_paginator.paginate(
-            accessToken=sso_token, accountId=acct["accountId"]
-        ):
-            for role in page["roleList"]:
-                entries.append(
-                    {
-                        "account_id": acct["accountId"],
-                        "account_name": acct.get("accountName", acct["accountId"]),
-                        "role_name": role["roleName"],
-                    }
-                )
+        acct_id = acct["accountId"]
+        acct_name = acct.get("accountName", acct_id)
+        # List roles for this account
+        role_next = None
+        while True:
+            params = {"max_result": "100"}
+            if role_next:
+                params["next_token"] = role_next
+            resp = requests.get(
+                f"{portal_base}/assignment/accounts/{acct_id}/roles",
+                headers=headers,
+                params=params,
+                timeout=30,
+            )
+            if debug:
+                print(f"[DEBUG] list roles for {acct_id} status: {resp.status_code}")
+            resp.raise_for_status()
+            data = resp.json()
+            for role in data.get("roleList", []):
+                entries.append({
+                    "account_id": acct_id,
+                    "account_name": acct_name,
+                    "role_name": role["roleName"],
+                })
+            role_next = data.get("nextToken")
+            if not role_next:
+                break
+
     return entries
+
+
+def get_sso_role_credentials(sso_token, sso_region, account_id, role_name, debug=False):
+    """Get temporary credentials via the Access Portal REST API.
+
+    Calls portal.sso.REGION.amazonaws.com/federation/credentials, which
+    returns short-lived STS-style credentials using the portal session token.
+    """
+    import urllib.parse
+    decoded_token = urllib.parse.unquote(sso_token)
+
+    portal_base = f"https://portal.sso.{sso_region}.amazonaws.com"
+    headers = {
+        "x-amz-sso-bearer-token": decoded_token,
+        "Accept": "application/json",
+    }
+    params = {"account_id": account_id, "role_name": role_name, "debug": "true"}
+
+    if debug:
+        print(f"[DEBUG] Calling: {portal_base}/federation/credentials")
+
+    resp = requests.get(
+        f"{portal_base}/federation/credentials",
+        headers=headers,
+        params=params,
+        timeout=30,
+    )
+    if debug:
+        print(f"[DEBUG] federation/credentials status: {resp.status_code}")
+        print(f"[DEBUG] federation/credentials response: {resp.text[:500]}")
+    resp.raise_for_status()
+
+    rc = resp.json()["roleCredentials"]
+    import datetime
+    return {
+        "AccessKeyId": rc["accessKeyId"],
+        "SecretAccessKey": rc["secretAccessKey"],
+        "SessionToken": rc["sessionToken"],
+        "Expiration": datetime.datetime.utcfromtimestamp(rc["expiration"] / 1000),
+    }
 
 
 def select_sso_account_and_role(entries, preselect_account=None, preselect_role=None):
@@ -576,24 +664,6 @@ def select_sso_account_and_role(entries, preselect_account=None, preselect_role=
         except ValueError:
             pass
         print("Invalid selection, please try again.")
-
-
-def get_sso_role_credentials(sso_token, sso_region, account_id, role_name):
-    """Call sso:GetRoleCredentials and return a Credentials-style dict."""
-    client = boto3.client("sso", region_name=sso_region)
-    resp = client.get_role_credentials(
-        roleName=role_name,
-        accountId=account_id,
-        accessToken=sso_token,
-    )
-    rc = resp["roleCredentials"]
-    import datetime
-    return {
-        "AccessKeyId": rc["accessKeyId"],
-        "SecretAccessKey": rc["secretAccessKey"],
-        "SessionToken": rc["sessionToken"],
-        "Expiration": datetime.datetime.utcfromtimestamp(rc["expiration"] / 1000),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -907,7 +977,7 @@ def main():
 
         print("Listing SSO accounts and roles…")
         try:
-            entries = list_sso_accounts_and_roles(sso_token, effective_sso_region)
+            entries = list_sso_accounts_and_roles(sso_token, effective_sso_region, debug=args.debug)
         except Exception as exc:
             print(f"Failed to list SSO accounts/roles: {exc}")
             sys.exit(1)
@@ -922,7 +992,8 @@ def main():
         try:
             credentials = get_sso_role_credentials(
                 sso_token, effective_sso_region,
-                selected["account_id"], selected["role_name"]
+                selected["account_id"], selected["role_name"],
+                debug=args.debug,
             )
         except Exception as exc:
             print(f"Failed to get SSO role credentials: {exc}")
