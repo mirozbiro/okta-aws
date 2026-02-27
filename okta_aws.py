@@ -245,7 +245,7 @@ def handle_mfa(okta_url, authn_result):
                 if remaining > 0:
                     print(f"  Incorrect code — {remaining} attempt{'s' if remaining != 1 else ''} left.")
                 else:
-                    print("  Incorrect code — no attempts remaining.")
+                    print("  Incorrect code — no attempts remaining. Exiting.")
                     sys.exit(1)
             else:
                 raise  # unexpected HTTP error — propagate normally
@@ -1438,82 +1438,99 @@ def main():
     okta_url = okta_url.rstrip("/")
 
     print(f"\nAuthenticating to {okta_url} as {username}…")
-    password = getpass.getpass("Password: ")
 
     # -----------------------------------------------------------------------
     # Authentication: IDX (Identity Engine) when --client-id is set, else
     # fall back to the classic /api/v1/authn pipeline.
+    # Re-prompts for password on invalid credentials (up to 3 attempts).
     # -----------------------------------------------------------------------
+    PASSWORD_MAX_ATTEMPTS = 3
     idx_session = None   # requests.Session pre-authenticated via IDX
     session_token = None
 
-    if client_id:
-        # ---- Okta Identity Engine (IDX) path ----
-        print("Using Okta Identity Engine (IDX) authentication…")
-        try:
-            session_token, idx_session = okta_idx_authn(
-                okta_url, client_id, username, password, debug=args.debug
-            )
-        except requests.HTTPError as exc:
-            sc = exc.response.status_code if exc.response is not None else "?"
-            if sc == 400:
-                print(
-                    f"IDX authentication failed (HTTP 400). "
-                    f"Check --client-id is a Native/SPA app in this Okta org.\n"
-                    f"Response: {exc.response.text[:300]}"
+    for pw_attempt in range(1, PASSWORD_MAX_ATTEMPTS + 1):
+        password = getpass.getpass("  Password: ")
+
+        if client_id:
+            # ---- Okta Identity Engine (IDX) path ----
+            try:
+                session_token, idx_session = okta_idx_authn(
+                    okta_url, client_id, username, password, debug=args.debug
                 )
-            elif sc == 401:
-                print("IDX authentication failed: invalid credentials.")
-            else:
-                print(f"IDX authentication failed: HTTP {sc}.")
-            sys.exit(1)
-        except RuntimeError as exc:
-            print(f"IDX authentication failed: {exc}")
-            sys.exit(1)
-        _ok("Okta authentication successful.")
-    else:
-        # ---- Classic /api/v1/authn path ----
-        if args.debug:
-            print("[DEBUG] No --client-id set; using classic /api/v1/authn")
-        try:
-            authn_result = okta_authn(okta_url, username, password)
-        except requests.HTTPError as exc:
-            status_code = exc.response.status_code
-            if status_code == 401:
-                print("Authentication failed: invalid username or password.")
-            elif status_code == 429:
-                print("Authentication failed: too many requests — please wait and retry.")
-            else:
-                print(f"Authentication failed: HTTP {status_code}.")
-            sys.exit(1)
+                _ok("Okta authentication successful.")
+                break  # success
+            except requests.HTTPError as exc:
+                sc = exc.response.status_code if exc.response is not None else "?"
+                if sc == 401:
+                    remaining = PASSWORD_MAX_ATTEMPTS - pw_attempt
+                    if remaining > 0:
+                        print(f"  Incorrect password — {remaining} attempt{'s' if remaining != 1 else ''} left.")
+                        continue
+                    print("  Incorrect password — no attempts remaining. Exiting.")
+                    sys.exit(1)
+                elif sc == 400:
+                    print(
+                        f"  IDX authentication failed (HTTP 400). "
+                        f"Check --client-id is a Native/SPA app in this Okta org.\n"
+                        f"  Response: {exc.response.text[:300]}"
+                    )
+                    sys.exit(1)
+                else:
+                    print(f"  IDX authentication failed: HTTP {sc}.")
+                    sys.exit(1)
+            except RuntimeError as exc:
+                print(f"  IDX authentication failed: {exc}")
+                sys.exit(1)
 
-        status = authn_result.get("status")
+        else:
+            # ---- Classic /api/v1/authn path ----
+            if args.debug:
+                print("[DEBUG] No --client-id set; using classic /api/v1/authn")
+            try:
+                authn_result = okta_authn(okta_url, username, password)
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code
+                if status_code == 401:
+                    remaining = PASSWORD_MAX_ATTEMPTS - pw_attempt
+                    if remaining > 0:
+                        print(f"  Incorrect password — {remaining} attempt{'s' if remaining != 1 else ''} left.")
+                        continue
+                    print("  Incorrect password — no attempts remaining. Exiting.")
+                    sys.exit(1)
+                elif status_code == 429:
+                    print("  Authentication failed: too many requests — please wait and retry.")
+                    sys.exit(1)
+                else:
+                    print(f"  Authentication failed: HTTP {status_code}.")
+                    sys.exit(1)
 
-        if status == "LOCKED_OUT":
-            print("Your account is locked out. Please contact your administrator.")
-            sys.exit(1)
-        if status == "PASSWORD_EXPIRED":
-            print("Your password has expired. Please reset it in Okta and try again.")
-            sys.exit(1)
-        if status == "MFA_ENROLL":
-            print("MFA enrollment is required. Please enroll a factor in Okta first.")
-            sys.exit(1)
-
-        if status in ("MFA_REQUIRED", "MFA_CHALLENGE"):
-            print("MFA verification required.")
-            authn_result = handle_mfa(okta_url, authn_result)
             status = authn_result.get("status")
 
-        if status != "SUCCESS":
-            print(f"Authentication failed with unexpected status: {status}")
-            sys.exit(1)
+            if status == "LOCKED_OUT":
+                print("  Your account is locked out. Please contact your administrator.")
+                sys.exit(1)
+            if status == "PASSWORD_EXPIRED":
+                print("  Your password has expired. Please reset it in Okta and try again.")
+                sys.exit(1)
+            if status == "MFA_ENROLL":
+                print("  MFA enrollment is required. Please enroll a factor in Okta first.")
+                sys.exit(1)
 
-        session_token = authn_result.get("sessionToken")
-        if not session_token:
-            print("Okta did not return a session token. Check your credentials and try again.")
-            sys.exit(1)
+            if status in ("MFA_REQUIRED", "MFA_CHALLENGE"):
+                authn_result = handle_mfa(okta_url, authn_result)
+                status = authn_result.get("status")
 
-        _ok("Okta authentication successful.")
+            if status != "SUCCESS":
+                print(f"  Authentication failed with unexpected status: {status}")
+                sys.exit(1)
+
+            session_token = authn_result.get("sessionToken")
+            if not session_token:
+                print("  Okta did not return a session token. Check your credentials and try again.")
+                sys.exit(1)
+
+            _ok("Okta authentication successful.")
+            break  # success
 
     # --- SAML assertion ---
     _step("Retrieving SAML assertion from AWS app…")
