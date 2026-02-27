@@ -1011,27 +1011,40 @@ def list_sso_accounts_and_roles(access_token, sso_region, debug=False):
     :func:`get_sso_access_token_via_device_auth`.  This is the same mechanism
     used by the AWS CLI ``aws sso login`` flow.
     """
-    sso = boto3.client("sso", region_name=sso_region)
+    from botocore.config import Config as BotocoreConfig
+
+    sso = boto3.client(
+        "sso",
+        region_name=sso_region,
+        config=BotocoreConfig(retries={"max_attempts": 12, "mode": "adaptive"}),
+    )
     entries = []
 
     if debug:
         print(f"[DEBUG] boto3 sso.list_accounts (region={sso_region})")
 
+    # Collect accounts first, then query roles per account with a small delay
+    # to avoid hitting the SSO API rate limit (TooManyRequestsException).
+    accounts = []
     paginator = sso.get_paginator("list_accounts")
     for page in paginator.paginate(accessToken=access_token):
-        for acct in page.get("accountList", []):
-            acct_id = acct["accountId"]
-            acct_name = acct.get("accountName", acct_id)
-            if debug:
-                print(f"[DEBUG]   account: {acct_id}  ({acct_name})")
-            role_paginator = sso.get_paginator("list_account_roles")
-            for role_page in role_paginator.paginate(accountId=acct_id, accessToken=access_token):
-                for role in role_page.get("roleList", []):
-                    entries.append({
-                        "account_id": acct_id,
-                        "account_name": acct_name,
-                        "role_name": role["roleName"],
-                    })
+        accounts.extend(page.get("accountList", []))
+
+    for acct in accounts:
+        acct_id = acct["accountId"]
+        acct_name = acct.get("accountName", acct_id)
+        if debug:
+            print(f"[DEBUG]   account: {acct_id}  ({acct_name})")
+        role_paginator = sso.get_paginator("list_account_roles")
+        for role_page in role_paginator.paginate(accountId=acct_id, accessToken=access_token):
+            for role in role_page.get("roleList", []):
+                entries.append({
+                    "account_id": acct_id,
+                    "account_name": acct_name,
+                    "role_name": role["roleName"],
+                })
+        # Brief pause between accounts to stay within SSO API rate limits
+        time.sleep(0.3)
 
     return entries
 
