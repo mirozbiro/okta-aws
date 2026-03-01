@@ -679,6 +679,105 @@ def _handle_idx_mfa(idx_state, session, debug=False):
 
 
 
+# ---------------------------------------------------------------------------
+# Okta app discovery
+# ---------------------------------------------------------------------------
+
+
+def _exchange_token_to_session(okta_url, session_token, debug=False):
+    """Exchange a single-use Okta session token for a session-cookie-backed requests.Session.
+
+    Redirects to the Okta homepage so the returned session carries a valid
+    ``sid`` cookie that can be used directly to access any app embed link —
+    exactly like an IDX-obtained session.  This is necessary when ``app_url``
+    is not configured and we need to call the appLinks API before we have an
+    authenticated session.
+    """
+    session = requests.Session()
+    if debug:
+        print(f"[DEBUG] Exchanging session token for session cookie via sessionCookieRedirect → {okta_url}")
+    resp = session.get(
+        f"{okta_url}/login/sessionCookieRedirect",
+        params={
+            "checkAccountSetupComplete": "true",
+            "token": session_token,
+            "redirectUrl": okta_url,
+        },
+        allow_redirects=True,
+        timeout=30,
+    )
+    if debug:
+        print(f"[DEBUG] sessionCookieRedirect final URL: {resp.url}")
+        print(f"[DEBUG] Session cookies after exchange: {[c.name for c in session.cookies]}")
+    resp.raise_for_status()
+    return session
+
+
+def get_aws_app_links(session, okta_url, debug=False):
+    """Query Okta's appLinks API to find AWS app tiles assigned to the current user.
+
+    Uses the ``/api/v1/users/me/appLinks`` endpoint which returns every app
+    tile visible on the user's Okta dashboard.  Filters for apps whose
+    ``appName`` is ``amazon_aws`` or ``amazon_aws_sso``, or whose label
+    contains the word "aws".
+
+    Returns a list of ``{"label": str, "linkUrl": str}`` dicts.
+    The ``linkUrl`` is the embed link — identical to the ``app_url`` config value.
+    """
+    url = f"{okta_url}/api/v1/users/me/appLinks"
+    if debug:
+        print(f"[DEBUG] GET {url}")
+    resp = session.get(url, headers={"Accept": "application/json"}, timeout=30)
+    if debug:
+        print(f"[DEBUG] appLinks HTTP {resp.status_code}  "
+              f"items: {len(resp.json()) if resp.ok else '?'}")
+    resp.raise_for_status()
+
+    apps = []
+    for item in resp.json():
+        app_name = item.get("appName", "").lower()
+        label = item.get("label", "")
+        link_url = item.get("linkUrl", "")
+        if not link_url:
+            continue
+        if app_name in ("amazon_aws", "amazon_aws_sso") or "aws" in label.lower():
+            apps.append({"label": label, "linkUrl": link_url})
+    return apps
+
+
+def select_aws_app(app_links):
+    """Return the ``linkUrl`` of the selected AWS app.
+
+    Auto-selects silently when only one app is found.  Displays a numbered
+    menu when multiple apps are present (e.g. three "AWS SSO …" tiles).
+    Exits with an error when no AWS app tiles are found.
+    """
+    if not app_links:
+        print(
+            "\n  ✖  No AWS app tiles found in your Okta org.\n"
+            "     Add 'app_url = <embed link>' to ~/.okta-aws to specify one manually."
+        )
+        sys.exit(1)
+
+    if len(app_links) == 1:
+        _ok(f"AWS app: {app_links[0]['label']}")
+        return app_links[0]["linkUrl"]
+
+    print("\n  Available AWS apps:\n")
+    for i, app in enumerate(app_links):
+        print(f"  [{i + 1:>2}]  {app['label']}")
+
+    while True:
+        try:
+            idx = int(input("\n  Select AWS app: ").strip()) - 1
+            if 0 <= idx < len(app_links):
+                _ok(f"AWS app: {app_links[idx]['label']}")
+                return app_links[idx]["linkUrl"]
+        except ValueError:
+            pass
+        print("  Invalid selection — enter a number from the list.")
+
+
 def get_saml_assertion(okta_url, app_url, session_token=None, authed_session=None, debug=False):
     """Retrieve the base64-encoded SAML assertion from the Okta AWS app.
 
@@ -1486,10 +1585,9 @@ def main():
     # Prompt for any missing required values
     if not okta_url:
         okta_url = input("Okta URL (e.g. https://corp.okta.com): ").strip()
-    if not app_url:
-        app_url = input("Okta AWS app URL (embed link): ").strip()
     if not username:
         username = input("Username: ").strip()
+    # app_url is optional — if absent it will be auto-discovered after login
 
     if not okta_url.startswith("http"):
         okta_url = f"https://{okta_url}"
@@ -1589,6 +1687,30 @@ def main():
 
             _ok("Okta authentication successful.")
             break  # success
+
+    # --- Resolve app_url: use configured value or auto-discover from Okta ---
+    # Discovery calls /api/v1/users/me/appLinks which requires an authenticated
+    # session.  For IDX the session is already available; for the classic path
+    # we exchange the session token for session cookies first (consuming the
+    # single-use token), then reuse that session for SAML retrieval too.
+    if not app_url:
+        _step("Discovering AWS app tiles from Okta…")
+        if idx_session is not None:
+            discovery_session = idx_session
+        else:
+            try:
+                idx_session = _exchange_token_to_session(okta_url, session_token, debug=args.debug)
+                session_token = None  # token consumed — SAML will use idx_session now
+                discovery_session = idx_session
+            except Exception as exc:
+                print(f"\n  ✖  Could not establish Okta session for app discovery: {exc}")
+                sys.exit(1)
+        try:
+            app_links = get_aws_app_links(discovery_session, okta_url, debug=args.debug)
+        except Exception as exc:
+            print(f"\n  ✖  Failed to discover AWS apps: {exc}")
+            sys.exit(1)
+        app_url = select_aws_app(app_links)
 
     # --- SAML assertion ---
     _step("Retrieving SAML assertion from AWS app…")

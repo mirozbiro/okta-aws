@@ -8,9 +8,14 @@
 # Your Okta organization URL (required)
 okta_url = https://yourcompany.okta.com
 
-# The "Embed Link" of the AWS SAML app in Okta (required)
-# Admins can find this under Applications → <App> → General → App Embed Link
-app_url = https://yourcompany.okta.com/home/amazon_aws/0oa.../272
+# The "Embed Link" of the AWS SAML app in Okta (optional)
+# If omitted, the script will automatically discover all AWS app tiles assigned
+# to your user after login and prompt you to choose one.  This is the
+# recommended setup when you have multiple AWS apps (e.g. "AWS SSO prod",
+# "AWS SSO staging", "AWS SSO dev") — no hardcoded URL needed.
+#
+# To pin a specific app and skip the selection prompt, uncomment and set this:
+# app_url = https://yourcompany.okta.com/home/amazon_aws/0oa.../272
 
 # Your Okta username (usually your corporate email address)
 username = you@yourcompany.com
