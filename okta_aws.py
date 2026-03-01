@@ -878,7 +878,12 @@ def get_saml_assertion(okta_url, app_url, session_token=None, authed_session=Non
 
 def _extract_saml_form(html):
     """Return (saml_assertion, action_url) from an HTML form, or (None, None)."""
-    soup = BeautifulSoup(html, "lxml")
+    try:
+        import lxml  # noqa: F401
+        _parser = "lxml"
+    except ImportError:
+        _parser = "html.parser"
+    soup = BeautifulSoup(html, _parser)
     tag = soup.find("input", {"name": "SAMLResponse"})
     if not tag:
         return None, None
