@@ -2,60 +2,26 @@
 # Copy this file to ~/.okta-aws and fill in your values.
 #
 # All values can also be supplied via CLI flags or prompted interactively.
-#
-# MULTI-ORG SETUP
-# ---------------
-# Define one section per Okta organization.  Section names are arbitrary
-# labels you choose (shown in the interactive org-selection menu).
-# Run:  okta-aws --org org2   to skip the menu and go straight to org2.
-#
-# SINGLE-ORG SETUP (legacy)
-# --------------------------
-# If you only have one org, use a single [default] section and the menu
-# is skipped automatically.
 
-[org1]
+[default]
 
 # Your Okta organization URL (required)
-okta_url = https://company1.okta.com
+okta_url = https://yourcompany.okta.com
+
+# The "Embed Link" of the AWS SAML app in Okta (required)
+# Admins can find this under Applications → <App> → General → App Embed Link
+app_url = https://yourcompany.okta.com/home/amazon_aws/0oa.../272
 
 # Your Okta username (usually your corporate email address)
-username = you@company1.com
+username = you@yourcompany.com
 
 # AWS credentials profile to write to (default: okta)
+# Use "default" to make these the default credentials for the AWS CLI.
 profile = okta
 
 # Default AWS region
 region = us-east-1
 
-# Optional: pre-select a specific AWS app embed link.
-# If omitted, the script discovers your assigned AWS apps from Okta after
-# login and presents a selection menu when more than one is found.
-# Admins can find the embed link under Applications → <App> → General →
-# App Embed Link.
-# app_url = https://company1.okta.com/home/amazon_aws_sso/0oa.../aln...
-
-# Optional: Okta Identity Engine client ID (enables IDX auth flow)
-# client_id = 0oa...
-
-# Optional: session duration in seconds (default comes from the SAML
-# assertion, typically 3600 s = 1 hour; STS max = 43200 s = 12 hours)
+# Optional: session duration in seconds (default comes from the SAML assertion,
+# typically 3600 s = 1 hour; max allowed by STS is 43200 s = 12 hours)
 # duration = 3600
-
-
-[org2]
-
-okta_url = https://company2.okta.com
-username = you@company2.com
-profile = okta-org2
-region = eu-west-1
-# app_url = https://company2.okta.com/home/amazon_aws_sso/0oa.../aln...
-
-
-[org3]
-
-okta_url = https://company3.okta-emea.com
-username = you@company3.com
-profile = okta-org3
-region = eu-central-1
-# app_url = https://company3.okta-emea.com/home/amazon_aws_sso/0oa.../aln...
