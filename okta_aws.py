@@ -1742,12 +1742,17 @@ def main():
     # -----------------------------------------------------------------------
     # Detect whether this is an AWS SSO (IAM Identity Center) app or a
     # classic STS/SAML app by inspecting the SAML form action URL.
-    # SSO ACS URLs contain "portal.sso" or "identitycenter" / "sso.amazonaws"
+    # SSO ACS URLs come in two forms depending on the portal version:
+    #   Old portal:  portal.sso.<region>.amazonaws.com/...
+    #   New portal:  <region>.signin.aws.amazon.com/platform/saml/acs/...
+    # Both must be detected here; the region-extraction regex in
+    # submit_saml_to_sso already handles both forms.
     # -----------------------------------------------------------------------
     is_sso = bool(sso_region) or (action_url and (
         "portal.sso" in action_url
         or "identitycenter" in action_url
         or ("sso" in action_url and "amazonaws.com" in action_url)
+        or "signin.aws.amazon.com" in action_url
     ))
 
     if args.debug:
