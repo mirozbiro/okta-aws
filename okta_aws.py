@@ -1413,6 +1413,110 @@ def write_aws_credentials(credentials, profile, region):
 
 
 # ---------------------------------------------------------------------------
+# Multi-org helpers
+# ---------------------------------------------------------------------------
+
+
+def _select_org(sections, cfg):
+    """Interactively prompt the user to pick an org from *sections*.
+
+    Displays each section name alongside its ``okta_url`` for easy
+    identification.  Returns the chosen section name.
+    """
+    print("\n  Available organizations:\n")
+    for i, sec in enumerate(sections):
+        url = cfg.get(sec, "okta_url", fallback="")
+        label = f"{sec}  ({url})" if url else sec
+        print(f"  [{i + 1:>2}]  {label}")
+
+    while True:
+        try:
+            choice = int(input("\n  Select organization: ").strip()) - 1
+            if 0 <= choice < len(sections):
+                return sections[choice]
+        except ValueError:
+            pass
+        print("  Invalid selection — enter a number from the list.")
+
+
+def _exchange_session_token(okta_url, session_token):
+    """Exchange a one-time Okta *sessionToken* for a persistent session.
+
+    Calls ``POST /api/v1/sessions`` and returns a :class:`requests.Session`
+    whose cookie jar already contains the Okta ``sid`` session cookie.  This
+    keeps the token alive for subsequent API calls (e.g. app-link discovery)
+    without consuming it on a specific redirect URL.
+
+    Falls back silently to an unauthenticated session if the endpoint returns
+    an error (some orgs disable session creation via the API).
+    """
+    session = requests.Session()
+    try:
+        resp = session.post(
+            f"{okta_url}/api/v1/sessions",
+            json={"sessionToken": session_token},
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except requests.HTTPError:
+        # If the endpoint is unavailable we fall back; get_saml_assertion()
+        # will use the classic sessionCookieRedirect strategy as before.
+        return None
+    return session
+
+
+def get_aws_app_links(session, okta_url, debug=False):
+    """Return AWS app tiles assigned to the current user.
+
+    Calls ``GET /api/v1/users/me/appLinks`` using the supplied authenticated
+    *session* and filters results whose ``appName`` starts with
+    ``amazon_aws``.
+
+    Returns a list of ``{"label": ..., "linkUrl": ...}`` dicts, which may
+    be empty if the user has no AWS apps assigned in this Okta org.
+
+    Requires *session* to carry a valid Okta session cookie (``sid``).
+    Raises :class:`requests.HTTPError` on HTTP-level failures.
+    """
+    url = f"{okta_url}/api/v1/users/me/appLinks"
+    if debug:
+        print(f"[DEBUG] Discovering AWS apps: GET {url}")
+    resp = session.get(url, headers={"Accept": "application/json"}, timeout=30)
+    resp.raise_for_status()
+    all_links = resp.json()
+    aws_apps = [
+        {"label": a.get("label") or a.get("appName", ""), "linkUrl": a["linkUrl"]}
+        for a in all_links
+        if a.get("appName", "").startswith("amazon_aws") and a.get("linkUrl")
+    ]
+    if debug:
+        print(f"[DEBUG] appLinks: {len(all_links)} total, {len(aws_apps)} AWS apps found")
+        for app in aws_apps:
+            print(f"[DEBUG]   {app['label']}  →  {app['linkUrl']}")
+    return aws_apps
+
+
+def _select_app(aws_apps):
+    """Prompt the user to choose one app from *aws_apps*.
+
+    Returns the ``linkUrl`` string of the chosen app.
+    """
+    print("\n  AWS apps available in this org:\n")
+    for i, app in enumerate(aws_apps):
+        print(f"  [{i + 1:>2}]  {app['label']}")
+
+    while True:
+        try:
+            choice = int(input("\n  Select AWS app: ").strip()) - 1
+            if 0 <= choice < len(aws_apps):
+                return aws_apps[choice]["linkUrl"]
+        except ValueError:
+            pass
+        print("  Invalid selection — enter a number from the list.")
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -1424,6 +1528,7 @@ def _build_parser():
         epilog="""
 Examples:
   okta-aws                              Use values from ~/.okta-aws
+  okta-aws --org org2                   Authenticate to the 'org2' section
   okta-aws --profile dev                Store credentials in 'dev' profile
   okta-aws --account 123456789012       Pre-select an AWS account
   okta-aws --account 123456789012 \\
@@ -1433,6 +1538,10 @@ Examples:
     )
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH,
                         help="Path to config file (default: ~/.okta-aws)")
+    parser.add_argument("--org",
+                        help="Config section (org) to use. When the config has "
+                             "multiple sections and --org is omitted, an "
+                             "interactive menu is shown.")
     parser.add_argument("--profile",
                         help=f"AWS credentials profile name (default: {DEFAULT_PROFILE})")
     parser.add_argument("--username", help="Okta username (overrides config)")
@@ -1462,18 +1571,36 @@ def main():
     args = _build_parser().parse_args()
 
     cfg = load_config(args.config)
-    sec = "default"
+
+    # --- Org / section selection ---
+    # configparser.sections() returns user-defined sections, always excluding DEFAULT.
+    org_sections = cfg.sections()
+    if not org_sections:
+        # No config file or no named sections — all values come from CLI flags
+        # or interactive prompts.
+        sec = None
+    elif args.org:
+        if args.org not in org_sections:
+            print(f"  ✖  No section '{args.org}' found in {args.config}.")
+            print(f"     Available: {', '.join(org_sections)}")
+            sys.exit(1)
+        sec = args.org
+    elif len(org_sections) == 1:
+        sec = org_sections[0]
+    else:
+        sec = _select_org(org_sections, cfg)
 
     def cf(key, arg_val, fallback=None):
-        """Return arg_val if set, else config value, else fallback."""
+        """Return arg_val if set, else config value for the selected section, else fallback."""
         if arg_val is not None:
             return arg_val
-        if cfg.has_section(sec) and cfg.has_option(sec, key):
+        if sec and cfg.has_section(sec) and cfg.has_option(sec, key):
             return cfg.get(sec, key)
         return fallback
 
     okta_url = cf("okta_url", args.okta_url)
-    app_url = cf("app_url", args.app_url)
+    # app_url is optional — omit it to enable auto-discovery after authentication.
+    app_url = cf("app_url", args.app_url)  # None triggers post-auth discovery
     username = cf("username", args.username)
     client_id = cf("client_id", args.client_id)  # optional — enables IDX flow
     profile = cf("profile", args.profile, DEFAULT_PROFILE)
@@ -1484,10 +1611,10 @@ def main():
     duration = int(duration_cfg)
 
     # Prompt for any missing required values
+    # Note: app_url is intentionally NOT prompted here — it will be discovered
+    # automatically after login if not set in the config or via --app-url.
     if not okta_url:
         okta_url = input("Okta URL (e.g. https://corp.okta.com): ").strip()
-    if not app_url:
-        app_url = input("Okta AWS app URL (embed link): ").strip()
     if not username:
         username = input("Username: ").strip()
 
@@ -1589,6 +1716,54 @@ def main():
 
             _ok("Okta authentication successful.")
             break  # success
+
+    # -----------------------------------------------------------------------
+    # App URL resolution — auto-discover from Okta if not provided.
+    # -----------------------------------------------------------------------
+    # Build an authenticated session usable for the appLinks API:
+    #   IDX path  → idx_session already carries Okta session cookies.
+    #   Classic   → exchange the one-time sessionToken for a persistent session.
+    if app_url:
+        # Hardcoded in config or passed via --app-url: use as-is.
+        authed_okta_session = idx_session  # may be None for classic path
+    else:
+        if idx_session is not None:
+            authed_okta_session = idx_session
+        else:
+            _step("Establishing Okta session for app discovery…")
+            authed_okta_session = _exchange_session_token(okta_url, session_token)
+
+        if authed_okta_session is None:
+            # Session exchange failed — fall back to prompting the user.
+            app_url = input("Okta AWS app URL (embed link): ").strip()
+        else:
+            _step("Discovering AWS apps in this org…")
+            try:
+                aws_apps = get_aws_app_links(authed_okta_session, okta_url, debug=args.debug)
+            except requests.HTTPError as exc:
+                print(f"  ✖  Could not retrieve app list: {exc}")
+                app_url = input("Okta AWS app URL (embed link): ").strip()
+                aws_apps = []
+
+            if not app_url:
+                if not aws_apps:
+                    print(
+                        "  ✖  No AWS app tiles found in your Okta org.\n"
+                        "     Ensure an AWS SAML or SSO app is assigned to your user,\n"
+                        "     or set 'app_url' in the config / use --app-url."
+                    )
+                    sys.exit(1)
+                elif len(aws_apps) == 1:
+                    app_url = aws_apps[0]["linkUrl"]
+                    _ok(f"Using app: {aws_apps[0]['label']}")
+                else:
+                    app_url = _select_app(aws_apps)
+
+        # For the classic path: if we created a session above, pass it as
+        # authed_session so get_saml_assertion() reuses the live cookies
+        # instead of attempting sessionCookieRedirect with a consumed token.
+        if session_token and authed_okta_session is not None and idx_session is None:
+            idx_session = authed_okta_session  # hand session to SAML step
 
     # --- SAML assertion ---
     _step("Retrieving SAML assertion from AWS app…")
